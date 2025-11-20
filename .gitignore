@@ -9,4 +9,3 @@ __pycache__/
 .terraform.lock.hcl
 terraform.tfvars
 scanner-lambda/qscanner
-scanner-lambda/qscanner.gz

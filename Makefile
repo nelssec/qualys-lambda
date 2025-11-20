@@ -28,9 +28,15 @@ help:
 layer:
 	@echo "Building QScanner Lambda Layer..."
 	@if [ ! -f scanner-lambda/qscanner ]; then \
-		echo "ERROR: qscanner binary not found in scanner-lambda/"; \
-		echo "Please download QScanner and place it in scanner-lambda/qscanner"; \
-		exit 1; \
+		if [ -f scanner-lambda/qscanner.gz ]; then \
+			echo "Decompressing qscanner.gz..."; \
+			gunzip -c scanner-lambda/qscanner.gz > scanner-lambda/qscanner; \
+			chmod +x scanner-lambda/qscanner; \
+		else \
+			echo "ERROR: qscanner binary not found in scanner-lambda/"; \
+			echo "Please download QScanner and place it in scanner-lambda/qscanner.gz or scanner-lambda/qscanner"; \
+			exit 1; \
+		fi; \
 	fi
 	@mkdir -p build/layer/bin
 	@cp scanner-lambda/qscanner build/layer/bin/
