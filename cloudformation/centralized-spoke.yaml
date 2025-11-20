@@ -45,6 +45,7 @@ Resources:
                   - lambda:GetFunctionConfiguration
                   - lambda:ListFunctions
                   - lambda:ListTags
+                  - lambda:TagResource
                 Resource: '*'
 
               # ECR Permissions (for container-based Lambdas)

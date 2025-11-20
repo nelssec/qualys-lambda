@@ -185,6 +185,7 @@ Resources:
                 Action:
                   - lambda:GetFunction
                   - lambda:GetFunctionConfiguration
+                  - lambda:TagResource
                 Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
               - Sid: SecretsManagerRead
                 Effect: Allow

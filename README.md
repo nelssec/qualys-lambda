@@ -137,12 +137,26 @@ Secrets Manager format:
 
 - Supports Zip and Container-based Lambda functions
 - DynamoDB caching prevents duplicate scans of same code (by CodeSha256)
+- Automatic Lambda tagging with scan results and RepoTags
 - Input validation on all credentials and ARNs
 - Log sanitization prevents credential leaks
 - Results stored in S3 with encryption
 - SNS notifications for scan completion
 - CloudTrail integration for event capture
 - Multi-region support
+
+### Lambda Tagging
+
+After each scan, the scanner automatically tags the scanned Lambda function with:
+- `QualysScanTimestamp` - ISO timestamp of the scan
+- `QualysScanStatus` - "success" or "failed"
+- `QualysRepoTag` - RepoTag value from QScanner results (e.g., "lambdascan:1763614101")
+
+This allows you to:
+- Correlate Lambda functions with their scan results in S3
+- Track when each Lambda was last scanned
+- Query Lambda functions by scan status
+- Match QScanner reports with specific Lambda functions using RepoTag
 
 ## Supported Qualys PODs
 
@@ -152,6 +166,8 @@ US1, US2, US3, US4, GOV1, EU1, EU2, EU3, IN1, CA1, AE1, UK1, AU1, KSA1
 
 Scanner Lambda needs:
 - lambda:GetFunction
+- lambda:GetFunctionConfiguration
+- lambda:TagResource
 - ecr:GetAuthorizationToken (on *)
 - ecr:BatchGetImage (on account repositories)
 - secretsmanager:GetSecretValue

@@ -231,6 +231,7 @@ Resources:
                 Action:
                   - lambda:GetFunction
                   - lambda:GetFunctionConfiguration
+                  - lambda:TagResource
                 Resource: !Sub 'arn:aws:lambda:*:${AWS::AccountId}:function:*'
 
               # Secrets Manager Permissions

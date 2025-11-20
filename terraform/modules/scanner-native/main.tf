@@ -240,7 +240,8 @@ resource "aws_iam_role_policy" "scanner_lambda" {
         Effect = "Allow"
         Action = [
           "lambda:GetFunction",
-          "lambda:GetFunctionConfiguration"
+          "lambda:GetFunctionConfiguration",
+          "lambda:TagResource"
         ]
         Resource = "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:*"
       },

@@ -240,6 +240,59 @@ def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: st
         raise ScanException(f"Scan timeout after {SCAN_TIMEOUT} seconds")
 
 
+def extract_repo_tags(scan_results: Dict[str, Any]) -> Optional[str]:
+    """Extract RepoTags from scan results JSON"""
+    try:
+        if 'results' in scan_results and isinstance(scan_results['results'], dict):
+            results = scan_results['results']
+
+            # Check for RepoTags in the results structure
+            if 'RepoTags' in results and isinstance(results['RepoTags'], list) and results['RepoTags']:
+                return results['RepoTags'][0]
+
+            # Sometimes RepoTags might be nested deeper in the structure
+            if 'image' in results and isinstance(results['image'], dict):
+                if 'RepoTags' in results['image'] and isinstance(results['image']['RepoTags'], list) and results['image']['RepoTags']:
+                    return results['image']['RepoTags'][0]
+
+        # Try parsing stdout if results is raw
+        if 'stdout' in scan_results and scan_results['stdout']:
+            try:
+                stdout_json = json.loads(scan_results['stdout'])
+                if 'RepoTags' in stdout_json and isinstance(stdout_json['RepoTags'], list) and stdout_json['RepoTags']:
+                    return stdout_json['RepoTags'][0]
+            except json.JSONDecodeError:
+                pass
+
+        logger.warning("No RepoTags found in scan results")
+        return None
+    except Exception as e:
+        logger.error(f"Error extracting RepoTags: {e}")
+        return None
+
+
+def tag_lambda_function(function_arn: str, repo_tag: Optional[str], scan_timestamp: str, scan_success: bool) -> None:
+    """Tag Lambda function with scan results"""
+    try:
+        tags = {
+            'QualysScanTimestamp': scan_timestamp,
+            'QualysScanStatus': 'success' if scan_success else 'failed'
+        }
+
+        if repo_tag:
+            tags['QualysRepoTag'] = repo_tag
+            logger.info(f"Tagging Lambda with RepoTag: {repo_tag}")
+
+        lambda_client.tag_resource(
+            Resource=function_arn,
+            Tags=tags
+        )
+
+        logger.info(f"Successfully tagged Lambda function: {function_arn}")
+    except Exception as e:
+        logger.error(f"Failed to tag Lambda function: {e}")
+
+
 def store_results(lambda_details: Dict[str, Any], scan_results: Dict[str, Any]) -> None:
     timestamp = datetime.utcnow().isoformat()
 
@@ -285,6 +338,10 @@ def store_results(lambda_details: Dict[str, Any], scan_results: Dict[str, Any]) 
             logger.info(f"Sent notification to SNS: {SNS_TOPIC_ARN}")
         except Exception as e:
             logger.error(f"Failed to send SNS notification: {e}")
+
+    # Tag the Lambda function with scan results
+    repo_tag = extract_repo_tags(scan_results)
+    tag_lambda_function(lambda_details['function_arn'], repo_tag, timestamp, scan_results['success'])
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
