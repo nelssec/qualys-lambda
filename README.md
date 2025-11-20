@@ -14,11 +14,23 @@ Automated scanning of AWS Lambda functions using Qualys QScanner. Triggered by E
 
 ### Prerequisites
 
-- QScanner binary from Qualys (Linux amd64)
+- QScanner binary from Qualys (Linux amd64, 37MB)
 - AWS CLI configured
-- Docker (for binaries over 50MB)
+- Docker (optional, for container-based deployment)
 
-### Using Docker (Recommended for >50MB binaries)
+### Using Lambda Layer (Recommended)
+
+QScanner binary is 37MB, well within Lambda's 50MB layer limit. This is the simplest deployment method.
+
+```bash
+# Place binary in scanner-lambda/qscanner
+export QUALYS_ACCESS_TOKEN="your-token"
+make deploy AWS_REGION=us-east-1 QUALYS_POD=US2
+```
+
+### Alternative: Using Docker Container
+
+For containerized deployment or if you prefer ECR-based distribution:
 
 ```bash
 # 1. Extract and place binary
@@ -52,14 +64,6 @@ aws cloudformation deploy \
     QualysSecretArn=$SECRET_ARN \
     ScannerImageUri=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/qualys-lambda-scanner:latest \
   --capabilities CAPABILITY_NAMED_IAM
-```
-
-### Using Lambda Layer (For binaries under 50MB)
-
-```bash
-# Place binary in scanner-lambda/qscanner
-export QUALYS_ACCESS_TOKEN="your-token"
-make deploy AWS_REGION=us-east-1 QUALYS_POD=US2
 ```
 
 ## QScanner Command
