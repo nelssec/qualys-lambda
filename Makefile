@@ -2,7 +2,7 @@
 
 # Variables
 AWS_REGION ?= us-east-1
-STACK_NAME ?= qualys-lambda-scanner
+STACK_NAME ?= qscanner
 QUALYS_POD ?= US2
 LAYER_NAME ?= qscanner
 S3_BUCKET ?= $(STACK_NAME)-artifacts-$(shell aws sts get-caller-identity --query Account --output text)
