@@ -50,8 +50,8 @@ def validate_pod(pod: str) -> bool:
 
 
 def validate_access_token(token: str) -> bool:
-    """Validate Qualys access token format"""
-    return bool(re.match(r'^[a-zA-Z0-9_-]{20,200}$', token))
+    """Validate Qualys access token format (supports JWT tokens)"""
+    return bool(re.match(r'^[a-zA-Z0-9_.-]{20,1000}$', token))
 
 
 def validate_function_arn(arn: str) -> bool:
@@ -469,6 +469,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'statusCode': 500,
             'body': json.dumps({
                 'message': 'Internal error',
-                'request_id': context.request_id
+                'request_id': context.aws_request_id
             })
         }
