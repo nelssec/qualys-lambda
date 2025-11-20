@@ -217,6 +217,9 @@ def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: st
         QSCANNER_PATH,
         '--pod', qualys_creds['qualys_pod'],
         '--access-token', qualys_creds['qualys_access_token'],
+        '--output-dir', '/tmp/qscanner-output',
+        '--cache-dir', '/tmp/qscanner-cache',
+        '--scan-types', 'pkg,secret',
         'lambda', function_arn
     ]
 
