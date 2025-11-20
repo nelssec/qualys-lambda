@@ -19,7 +19,7 @@ EventBridge rules capture Lambda API events from CloudTrail:
 - UpdateFunctionConfiguration20150331v2
 
 ### Scanner Lambda
-Python Lambda function with QScanner binary deployed as Lambda Layer or container image. Executes QScanner against target Lambda functions and stores results.
+Python Lambda function with QScanner binary deployed as Lambda Layer. Executes QScanner against target Lambda functions and stores results.
 
 ### Deployment Models
 
@@ -44,74 +44,23 @@ Tags enable correlation between Lambda functions and their scan results in S3, t
 
 ### Prerequisites
 
-- QScanner binary from Qualys (Linux amd64, 37MB)
+- QScanner binary from Qualys (Linux amd64)
 - AWS CLI configured
-- Docker (optional, for container-based deployment)
 
-### Using Lambda Layer (Recommended)
-
-QScanner binary is 37MB, well within Lambda's 50MB layer limit. This is the simplest deployment method.
+### Deployment
 
 ```bash
-# Place binary in scanner-lambda/qscanner
 export QUALYS_ACCESS_TOKEN="your-token"
 make deploy AWS_REGION=us-east-1 QUALYS_POD=US2
 ```
 
-### Alternative: Using Docker Container
-
-For containerized deployment or if you prefer ECR-based distribution:
+### Terraform Deployment
 
 ```bash
-# 1. Extract and place binary
-cd scanner-lambda
-tar -xzf /path/to/qscanner.tar.gz
-chmod +x qscanner
-
-# 2. Build and push Docker image
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export AWS_REGION=us-east-1
-
-aws ecr create-repository --repository-name qualys-lambda-scanner --region $AWS_REGION
-docker build -t qualys-lambda-scanner .
-aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-docker tag qualys-lambda-scanner:latest $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/qualys-lambda-scanner:latest
-docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/qualys-lambda-scanner:latest
-
-# 3. Create secret
-export QUALYS_ACCESS_TOKEN="your-token"
-SECRET_ARN=$(aws secretsmanager create-secret \
-  --name "qualys-lambda-scanner-credentials" \
-  --secret-string '{"qualys_pod":"US2","qualys_access_token":"'$QUALYS_ACCESS_TOKEN'"}' \
-  --region $AWS_REGION --query ARN --output text)
-
-# 4. Deploy CloudFormation
-aws cloudformation deploy \
-  --template-file cloudformation/single-account.yaml \
-  --stack-name qualys-lambda-scanner \
-  --parameter-overrides \
-    QualysPod=US2 \
-    QualysSecretArn=$SECRET_ARN \
-    ScannerImageUri=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/qualys-lambda-scanner:latest \
-  --capabilities CAPABILITY_NAMED_IAM
-```
-
-### Using Terraform
-
-For infrastructure-as-code deployment with Terraform:
-
-```bash
-# 1. Build Lambda Layer
 ./scripts/build-layer.sh
-
-# 2. Navigate to Terraform example
 cd terraform/examples/single-region-native
-
-# 3. Configure variables
 cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars with your Qualys credentials
 
-# 4. Deploy
 terraform init
 terraform plan
 terraform apply
@@ -149,8 +98,8 @@ Secrets Manager format:
 
 ## Features
 
-- Supports Zip and Container-based Lambda functions
-- DynamoDB caching prevents duplicate scans of same code (by CodeSha256)
+- Scans all Lambda functions in account
+- DynamoDB caching prevents duplicate scans (by CodeSha256)
 - Automatic Lambda tagging with scan results and RepoTags
 - Input validation on all credentials and ARNs
 - Log sanitization prevents credential leaks
@@ -169,8 +118,6 @@ Scanner Lambda needs:
 - lambda:GetFunction
 - lambda:GetFunctionConfiguration
 - lambda:TagResource
-- ecr:GetAuthorizationToken (on *)
-- ecr:BatchGetImage (on account repositories)
 - secretsmanager:GetSecretValue
 - s3:PutObject (optional)
 - sns:Publish (optional)
@@ -187,16 +134,18 @@ Scanner Lambda needs:
 
 ## Testing
 
+Create a test Lambda function:
 ```bash
-# Create test Lambda
 aws lambda create-function \
   --function-name test-scanner-target \
   --runtime python3.11 \
   --handler lambda_function.lambda_handler \
   --zip-file fileb://test.zip \
   --role arn:aws:iam::ACCOUNT:role/execution-role
+```
 
-# Watch scanner logs
+View scanner logs:
+```bash
 aws logs tail /aws/lambda/qualys-lambda-scanner-scanner --follow
 ```
 
@@ -204,50 +153,29 @@ aws logs tail /aws/lambda/qualys-lambda-scanner-scanner --follow
 
 Estimated monthly cost for 100 Lambda deployments:
 - Scanner Lambda: $5
-- ECR Storage: $1
 - S3 Storage: $1
 - Secrets Manager: $0.40
 - DynamoDB: $1
 - CloudWatch Logs: $1
-- Total: ~$9.40/month
+- Total: ~$8.40/month
 
 ## Repository Structure
 
 ```
 qualys-lambda/
 ├── scanner-lambda/
-│   ├── lambda_function.py    # Main scanner Lambda handler
-│   ├── Dockerfile            # Docker image for container deployment
-│   └── requirements.txt      # Python dependencies
+│   ├── lambda_function.py
+│   └── requirements.txt
 ├── cloudformation/
-│   ├── single-account.yaml           # Docker-based deployment
-│   ├── single-account-native.yaml    # Lambda Layer deployment
-│   ├── stackset.yaml                 # Multi-account StackSet
-│   ├── centralized-hub.yaml          # Hub account template
-│   └── centralized-spoke.yaml        # Spoke account template
+│   ├── single-account-native.yaml
+│   ├── stackset.yaml
+│   ├── centralized-hub.yaml
+│   └── centralized-spoke.yaml
 ├── terraform/
-│   ├── modules/
-│   │   └── scanner-native/           # Native Terraform module
-│   │       ├── main.tf
-│   │       ├── variables.tf
-│   │       └── outputs.tf
-│   └── examples/
-│       └── single-region-native/     # Example deployment
-│           ├── main.tf
-│           ├── variables.tf
-│           └── README.md
+│   ├── modules/scanner-native/
+│   └── examples/single-region-native/
 ├── scripts/
-│   └── build-layer.sh        # Build Lambda Layer
-├── Makefile                  # Build automation
+│   └── build-layer.sh
+├── Makefile
 └── README.md
-```
-
-## Makefile Targets
-
-```
-make layer                 - Build QScanner Lambda Layer
-make package              - Package Lambda function code
-make deploy               - Deploy scanner to single region
-make deploy-multi-region  - Deploy to multiple regions
-make clean                - Clean build artifacts
 ```
