@@ -94,6 +94,11 @@ Secrets Manager format:
 }
 ```
 
+CloudFormation parameters:
+- CreateCloudTrail - Set to 'true' only if you do not have an existing CloudTrail (default: 'false')
+
+Note: EventBridge rules work with any CloudTrail in your account. Creating additional trails costs $2 per 100,000 events. Only create a new trail if you have no existing trail logging management events.
+
 ## Features
 
 - Scans all Lambda functions in account

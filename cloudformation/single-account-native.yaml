@@ -82,10 +82,19 @@ Parameters:
     MinValue: 1
     MaxValue: 365
 
+  CreateCloudTrail:
+    Type: String
+    Description: 'Create new CloudTrail (false if you have existing trail)'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
 Conditions:
   CreateS3Bucket: !Equals [!Ref EnableS3Results, 'true']
   CreateSNSTopic: !Equals [!Ref EnableSNSNotifications, 'true']
   CreateScanCache: !Equals [!Ref EnableScanCache, 'true']
+  CreateTrail: !Equals [!Ref CreateCloudTrail, 'true']
 
 Resources:
   ScanResultsBucket:
@@ -364,12 +373,14 @@ Resources:
 
   CloudTrailLogGroup:
     Type: AWS::Logs::LogGroup
+    Condition: CreateTrail
     Properties:
       LogGroupName: !Sub '/aws/cloudtrail/${AWS::StackName}'
       RetentionInDays: 7
 
   CloudTrailBucket:
     Type: AWS::S3::Bucket
+    Condition: CreateTrail
     Properties:
       BucketName: !Sub '${AWS::StackName}-cloudtrail-${AWS::AccountId}'
       PublicAccessBlockConfiguration:
@@ -387,6 +398,7 @@ Resources:
 
   CloudTrailBucketPolicy:
     Type: AWS::S3::BucketPolicy
+    Condition: CreateTrail
     Properties:
       Bucket: !Ref CloudTrailBucket
       PolicyDocument:
@@ -410,6 +422,7 @@ Resources:
 
   CloudTrail:
     Type: AWS::CloudTrail::Trail
+    Condition: CreateTrail
     DependsOn: CloudTrailBucketPolicy
     Properties:
       TrailName: !Sub '${AWS::StackName}-trail'
@@ -427,6 +440,7 @@ Resources:
 
   CloudTrailLogsRole:
     Type: AWS::IAM::Role
+    Condition: CreateTrail
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -469,6 +483,7 @@ Outputs:
 
   CloudTrailName:
     Description: 'Name of the CloudTrail trail'
+    Condition: CreateTrail
     Value: !Ref CloudTrail
     Export:
       Name: !Sub '${AWS::StackName}-CloudTrail'
