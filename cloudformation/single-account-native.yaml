@@ -10,11 +10,17 @@ Parameters:
       - US1
       - US2
       - US3
+      - US4
+      - GOV1
       - EU1
       - EU2
+      - EU3
       - IN1
       - CA1
       - AE1
+      - UK1
+      - AU1
+      - KSA1
 
   QualysAccessToken:
     Type: String
@@ -62,9 +68,25 @@ Parameters:
     MinValue: 512
     MaxValue: 10240
 
+  EnableScanCache:
+    Type: String
+    Description: 'Enable DynamoDB scan cache to prevent duplicate scans'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  CacheTTLDays:
+    Type: Number
+    Description: 'Number of days to cache scan results'
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+
 Conditions:
   CreateS3Bucket: !Equals [!Ref EnableS3Results, 'true']
   CreateSNSTopic: !Equals [!Ref EnableSNSNotifications, 'true']
+  CreateScanCache: !Equals [!Ref EnableScanCache, 'true']
 
 Resources:
   QualysCredentialsSecret:
@@ -123,6 +145,27 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
+  ScanCacheTable:
+    Type: AWS::DynamoDB::Table
+    Condition: CreateScanCache
+    Properties:
+      TableName: !Sub '${AWS::StackName}-scan-cache'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: function_arn
+          AttributeType: S
+      KeySchema:
+        - AttributeName: function_arn
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scan-cache'
+        - Key: ManagedBy
+          Value: CloudFormation
+
   ScannerLambdaRole:
     Type: AWS::IAM::Role
     Properties:
@@ -161,6 +204,16 @@ Resources:
                 Action:
                   - secretsmanager:GetSecretValue
                 Resource: !GetAtt QualysCredentialsSecret.Id
+              - !If
+                - CreateScanCache
+                - Sid: DynamoDBAccess
+                  Effect: Allow
+                  Action:
+                    - dynamodb:GetItem
+                    - dynamodb:PutItem
+                    - dynamodb:UpdateItem
+                  Resource: !GetAtt ScanCacheTable.Arn
+                - !Ref AWS::NoValue
               - !If
                 - CreateS3Bucket
                 - Sid: S3Write
@@ -222,7 +275,10 @@ Resources:
           QUALYS_SECRET_ARN: !Ref QualysCredentialsSecret
           RESULTS_S3_BUCKET: !If [CreateS3Bucket, !Ref ScanResultsBucket, '']
           SNS_TOPIC_ARN: !If [CreateSNSTopic, !Ref ScanNotificationsTopic, '']
+          SCAN_CACHE_TABLE: !If [CreateScanCache, !Ref ScanCacheTable, '']
           SCAN_TIMEOUT: '300'
+          CACHE_TTL_DAYS: !Ref CacheTTLDays
+          QSCANNER_PATH: '/opt/bin/qscanner'
       Code:
         ZipFile: |
           # Placeholder - replace with actual code via S3 or inline
@@ -435,3 +491,10 @@ Outputs:
     Value: !Ref CloudTrail
     Export:
       Name: !Sub '${AWS::StackName}-CloudTrail'
+
+  ScanCacheTableName:
+    Description: 'Name of the DynamoDB scan cache table'
+    Condition: CreateScanCache
+    Value: !Ref ScanCacheTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanCacheTable'

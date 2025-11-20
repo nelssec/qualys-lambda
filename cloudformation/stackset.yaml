@@ -10,11 +10,17 @@ Parameters:
       - US1
       - US2
       - US3
+      - US4
+      - GOV1
       - EU1
       - EU2
+      - EU3
       - IN1
       - CA1
       - AE1
+      - UK1
+      - AU1
+      - KSA1
 
   QualysAccessToken:
     Type: String
@@ -30,16 +36,40 @@ Parameters:
     Description: 'Create S3 bucket for storing scan results'
     Default: 'true'
     AllowedValues:
-      - 'true'
-      - 'false'
+      - US1
+      - US2
+      - US3
+      - US4
+      - GOV1
+      - EU1
+      - EU2
+      - EU3
+      - IN1
+      - CA1
+      - AE1
+      - UK1
+      - AU1
+      - KSA1
 
   EnableSNSNotifications:
     Type: String
     Description: 'Create SNS topic for scan notifications'
     Default: 'true'
     AllowedValues:
-      - 'true'
-      - 'false'
+      - US1
+      - US2
+      - US3
+      - US4
+      - GOV1
+      - EU1
+      - EU2
+      - EU3
+      - IN1
+      - CA1
+      - AE1
+      - UK1
+      - AU1
+      - KSA1
 
   ScannerMemorySize:
     Type: Number

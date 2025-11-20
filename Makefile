@@ -6,6 +6,7 @@ STACK_NAME ?= qualys-lambda-scanner
 QUALYS_POD ?= US2
 LAYER_NAME ?= qscanner
 S3_BUCKET ?= $(STACK_NAME)-artifacts-$(shell aws sts get-caller-identity --query Account --output text)
+QUALYS_ACCESS_TOKEN ?= $(shell echo $$QUALYS_ACCESS_TOKEN)
 
 help:
 	@echo "Qualys Lambda Scanner - Makefile"
@@ -21,7 +22,7 @@ help:
 	@echo "  AWS_REGION           - AWS region (default: us-east-1)"
 	@echo "  STACK_NAME           - CloudFormation stack name"
 	@echo "  QUALYS_POD           - Qualys POD (default: US2)"
-	@echo "  QUALYS_TOKEN         - Qualys access token (required for deploy)"
+	@echo "  QUALYS_ACCESS_TOKEN  - Qualys access token (required for deploy)"
 
 # Build Lambda Layer with QScanner binary
 layer:
@@ -73,8 +74,8 @@ upload-function: package create-bucket
 # Deploy stack (native Lambda with Layer)
 deploy: publish-layer upload-function
 	@echo "Deploying CloudFormation stack..."
-	@if [ -z "$(QUALYS_TOKEN)" ]; then \
-		echo "ERROR: QUALYS_TOKEN environment variable not set"; \
+	@if [ -z "$(QUALYS_ACCESS_TOKEN)" ]; then \
+		echo "ERROR: QUALYS_ACCESS_TOKEN environment variable not set"; \
 		exit 1; \
 	fi
 	@aws cloudformation deploy \
@@ -82,7 +83,7 @@ deploy: publish-layer upload-function
 		--stack-name $(STACK_NAME) \
 		--parameter-overrides \
 			QualysPod=$(QUALYS_POD) \
-			QualysAccessToken=$(QUALYS_TOKEN) \
+			QualysAccessToken=$(QUALYS_ACCESS_TOKEN) \
 			QScannerLayerArn=$$(cat build/layer-arn.txt) \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--region $(AWS_REGION)
