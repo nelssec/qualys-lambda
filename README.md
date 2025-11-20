@@ -1,139 +1,104 @@
-# Qualys Lambda Scanner Pipeline
+# Qualys Lambda Scanner
 
-Automated security scanning for AWS Lambda functions using Qualys QScanner. Scans Lambda functions when deployed or updated.
+Automated scanning of AWS Lambda functions using Qualys QScanner. Triggered by EventBridge when Lambda functions are deployed or updated.
 
 ## How It Works
 
 1. Lambda function deployed/updated
-2. CloudTrail captures Lambda API call (CreateFunction, UpdateFunctionCode, UpdateFunctionConfiguration)
-3. EventBridge rule matches event and triggers scanner Lambda
-4. Scanner Lambda retrieves Qualys credentials from Secrets Manager
-5. Scanner Lambda executes qscanner binary against target Lambda ARN
-6. QScanner downloads Lambda code (zip or container image) and scans it
-7. Results sent to Qualys platform, stored in S3, and published to SNS
+2. CloudTrail logs API call
+3. EventBridge triggers scanner Lambda
+4. Scanner executes qscanner binary against target Lambda
+5. Results sent to Qualys, stored in S3, published to SNS
 
-## Key Features
+## Deployment
 
-- Automatic scanning via EventBridge on Lambda deploy/update
-- Supports both Zip and Container-based Lambda functions
-- Native Lambda deployment (no Docker required if qscanner binary < 50MB)
-- Multi-region and multi-account deployment options
-- Results in S3 with SNS notifications
-- Qualys credentials in Secrets Manager
+### Prerequisites
 
-## Quick Start (Native Lambda)
+- QScanner binary from Qualys (Linux amd64)
+- AWS CLI configured
+- Docker (for binaries over 50MB)
+
+### Using Docker (Recommended for >50MB binaries)
 
 ```bash
-# Place QScanner binary
-cp /path/to/qscanner scanner-lambda/
-
-# Deploy using Makefile
-export QUALYS_TOKEN="your-token"
-make deploy AWS_REGION=us-east-1 QUALYS_POD=US2
-
-# Or deploy manually
-make layer
-make package
-aws cloudformation deploy --template-file cloudformation/single-account-native.yaml ...
-```
-
-This creates a Python Lambda function with a Lambda Layer containing qscanner binary. No Docker or ECR needed.
-
-## Quick Start (Docker Container)
-
-If qscanner binary is larger than 50MB or you prefer containers:
-
-```bash
+# 1. Extract and place binary
 cd scanner-lambda
-docker build -t qualys-lambda-scanner .
-docker push ACCOUNT.dkr.ecr.REGION.amazonaws.com/qualys-lambda-scanner:latest
+tar -xzf /path/to/qscanner.tar.gz
+chmod +x qscanner
 
+# 2. Build and push Docker image
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export AWS_REGION=us-east-1
+
+aws ecr create-repository --repository-name qualys-lambda-scanner --region $AWS_REGION
+docker build -t qualys-lambda-scanner .
+aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+docker tag qualys-lambda-scanner:latest $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/qualys-lambda-scanner:latest
+docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/qualys-lambda-scanner:latest
+
+# 3. Create secret
+export QUALYS_ACCESS_TOKEN="your-token"
+SECRET_ARN=$(aws secretsmanager create-secret \
+  --name "qualys-lambda-scanner-credentials" \
+  --secret-string '{"qualys_pod":"US2","qualys_access_token":"'$QUALYS_ACCESS_TOKEN'"}' \
+  --region $AWS_REGION --query ARN --output text)
+
+# 4. Deploy CloudFormation
 aws cloudformation deploy \
   --template-file cloudformation/single-account.yaml \
   --stack-name qualys-lambda-scanner \
   --parameter-overrides \
-    ScannerImageUri=ACCOUNT.dkr.ecr.REGION.amazonaws.com/qualys-lambda-scanner:latest \
     QualysPod=US2 \
-    QualysAccessToken=TOKEN \
+    QualysSecretArn=$SECRET_ARN \
+    ScannerImageUri=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/qualys-lambda-scanner:latest \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
-## Deployment Options
+### Using Lambda Layer (For binaries under 50MB)
 
-1. Single Account
-   Scanner deployed in one account, scans Lambdas in that account
-   Template: cloudformation/single-account-native.yaml or single-account.yaml
-
-2. Multi-Account StackSet
-   Scanner deployed to each account via StackSet
-   Template: cloudformation/stackset.yaml
-
-3. Centralized Hub-Spoke
-   Single scanner in security account, spoke accounts forward events
-   Templates: centralized-hub.yaml, centralized-spoke.yaml
-
-## Multi-Region Deployment
-
-Using Makefile:
 ```bash
-make deploy-multi-region
+# Place binary in scanner-lambda/qscanner
+export QUALYS_ACCESS_TOKEN="your-token"
+make deploy AWS_REGION=us-east-1 QUALYS_POD=US2
 ```
 
-Using Terraform:
+## QScanner Command
+
+The scanner executes:
 ```bash
-cd terraform/examples/single-account-multi-region
-terraform init
-terraform apply
+/opt/qscanner --pod US2 --access-token <from-secrets> lambda arn:aws:lambda:region:account:function:name
 ```
 
-## Repository Structure
+Environment variables set:
+- AWS_REGION
+- QSCANNER_REGISTRY_USERNAME (optional)
+- QSCANNER_REGISTRY_PASSWORD (optional)
 
-```
-qualys-lambda/
-├── scanner-lambda/                  # Lambda function code
-│   ├── lambda_function.py          # Scanner Lambda handler
-│   ├── Dockerfile                  # For Docker deployment
-│   └── requirements.txt
-├── cloudformation/                  # CloudFormation templates
-│   ├── single-account-native.yaml  # Native Lambda (no Docker)
-│   ├── single-account.yaml         # Docker-based Lambda
-│   ├── stackset.yaml               # Multi-account StackSet
-│   ├── centralized-hub.yaml        # Hub-spoke hub
-│   └── centralized-spoke.yaml      # Hub-spoke spoke
-├── terraform/                       # Terraform modules
-│   ├── modules/                    # Reusable modules
-│   └── examples/                   # Example configurations
-├── Makefile                        # Build and deploy automation
-└── DEPLOYMENT_NATIVE.md            # Detailed deployment guide
-```
+## Deployment Models
 
-## Binary Loading
+### Single Account
+Scanner deployed in one account, scans Lambdas in that account.
+Template: `cloudformation/single-account.yaml` or `single-account-native.yaml`
 
-The qscanner binary is loaded differently depending on deployment method:
+### Multi-Account StackSet
+Scanner deployed to each account via StackSet.
+Template: `cloudformation/stackset.yaml`
 
-Native Lambda (Layer):
-- qscanner binary packaged into Lambda Layer at build time
-- Layer structure: bin/qscanner
-- Lambda function accesses binary at /opt/bin/qscanner
-- subprocess.run(['/opt/bin/qscanner', 'lambda', 'function-arn'])
-
-Docker Container:
-- qscanner binary copied into Docker image via Dockerfile COPY
-- Binary located at /opt/qscanner in container
-- Lambda function accesses binary at /opt/qscanner
-- subprocess.run(['/opt/qscanner', 'lambda', 'function-arn'])
-
-No runtime download needed in either case.
+### Centralized Hub-Spoke
+Single scanner in security account, spoke accounts forward events.
+Templates: `centralized-hub.yaml`, `centralized-spoke.yaml`
 
 ## Configuration
 
 Scanner Lambda environment variables:
-- QUALYS_SECRET_ARN: Secrets Manager secret with Qualys credentials
-- RESULTS_S3_BUCKET: S3 bucket for scan results (optional)
-- SNS_TOPIC_ARN: SNS topic for notifications (optional)
-- SCAN_TIMEOUT: Scan timeout in seconds (default 300)
+- QUALYS_SECRET_ARN - Secrets Manager ARN
+- RESULTS_S3_BUCKET - S3 bucket for results
+- SNS_TOPIC_ARN - SNS topic for notifications
+- SCAN_CACHE_TABLE - DynamoDB table for caching
+- SCAN_TIMEOUT - Timeout in seconds (default 300)
+- CACHE_TTL_DAYS - Cache TTL in days (default 30)
 
-Secrets Manager secret format:
+Secrets Manager format:
 ```json
 {
   "qualys_pod": "US2",
@@ -141,22 +106,47 @@ Secrets Manager secret format:
 }
 ```
 
+## Features
+
+- Supports Zip and Container-based Lambda functions
+- DynamoDB caching prevents duplicate scans of same code (by CodeSha256)
+- Input validation on all credentials and ARNs
+- Log sanitization prevents credential leaks
+- Results stored in S3 with encryption
+- SNS notifications for scan completion
+- CloudTrail integration for event capture
+- Multi-region support
+
+## Supported Qualys PODs
+
+US1, US2, US3, US4, GOV1, EU1, EU2, EU3, IN1, CA1, AE1, UK1, AU1, KSA1
+
 ## IAM Permissions
 
-Scanner Lambda execution role needs:
-- lambda:GetFunction - Read target Lambda configuration
-- ecr:GetAuthorizationToken, ecr:BatchGetImage - Pull container images (for container Lambdas)
-- secretsmanager:GetSecretValue - Read Qualys credentials
-- s3:PutObject - Store scan results
-- sns:Publish - Send notifications
-- logs:CreateLogGroup, logs:PutLogEvents - CloudWatch logging
+Scanner Lambda needs:
+- lambda:GetFunction
+- ecr:GetAuthorizationToken (on *)
+- ecr:BatchGetImage (on account repositories)
+- secretsmanager:GetSecretValue
+- s3:PutObject (optional)
+- sns:Publish (optional)
+- dynamodb:GetItem, PutItem (for cache)
+
+## Security
+
+- Credentials stored in Secrets Manager, never in CloudFormation parameters
+- Input validation prevents command injection
+- Log output sanitized to prevent credential exposure
+- Least privilege IAM policies
+- S3 buckets encrypted and versioned
+- DynamoDB with automatic TTL cleanup
 
 ## Testing
 
-Create a test Lambda:
 ```bash
+# Create test Lambda
 aws lambda create-function \
-  --function-name test-target \
+  --function-name test-scanner-target \
   --runtime python3.11 \
   --handler lambda_function.lambda_handler \
   --zip-file fileb://test.zip \
@@ -166,49 +156,37 @@ aws lambda create-function \
 aws logs tail /aws/lambda/qualys-lambda-scanner-scanner --follow
 ```
 
-## Limitations
-
-- Scanner Lambda max timeout: 15 minutes
-- Lambda Layer max size: 50MB compressed (250MB uncompressed)
-- Requires CloudTrail enabled
-- EventBridge rules are regional (deploy per-region if needed)
-- Large Lambda packages may timeout during scan
-
 ## Costs
 
-Estimated monthly cost for single account with 100 Lambda deployments/month:
+Estimated monthly cost for 100 Lambda deployments:
 - Scanner Lambda: $5
-- EventBridge: Free
+- ECR Storage: $1
 - S3 Storage: $1
 - Secrets Manager: $0.40
+- DynamoDB: $1
 - CloudWatch Logs: $1
-- Total: ~$7.40/month
+- Total: ~$9.40/month
 
-## Documentation
+## Repository Structure
 
-- DEPLOYMENT_NATIVE.md - Native Lambda deployment guide
-- ARCHITECTURE.md - Detailed architecture
-- docs/DEPLOYMENT.md - Step-by-step deployment
-- terraform/README.md - Terraform deployment
-- scanner-lambda/README.md - Lambda function details
-
-## Troubleshooting
-
-Scanner not triggering:
-- Verify CloudTrail enabled and logging Lambda API calls
-- Check EventBridge rule is enabled
-- Review CloudWatch Logs for scanner Lambda
-
-Scan failures:
-- Check scanner Lambda has sufficient memory/timeout
-- Verify Qualys credentials valid
-- Ensure scanner Lambda has ECR/Lambda permissions
-- Check qscanner binary is executable
-
-Cross-account issues (centralized):
-- Verify spoke role exists and trusts security account
-- Check event forwarding rules in spoke accounts
-- Verify central event bus policy allows spoke accounts
+```
+qualys-lambda/
+├── scanner-lambda/
+│   ├── lambda_function.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── cloudformation/
+│   ├── single-account.yaml
+│   ├── single-account-native.yaml
+│   ├── stackset.yaml
+│   ├── centralized-hub.yaml
+│   └── centralized-spoke.yaml
+├── terraform/
+│   ├── modules/
+│   └── examples/
+├── Makefile
+└── README.md
+```
 
 ## Makefile Targets
 
@@ -216,14 +194,6 @@ Cross-account issues (centralized):
 make layer                 - Build QScanner Lambda Layer
 make package              - Package Lambda function code
 make deploy               - Deploy scanner to single region
-make deploy-multi-region  - Deploy scanner to multiple regions
-make update-function      - Update Lambda function code only
+make deploy-multi-region  - Deploy to multiple regions
 make clean                - Clean build artifacts
-make delete               - Delete CloudFormation stack
 ```
-
-## Support
-
-- Solution issues: GitHub issues
-- QScanner: Qualys Support
-- AWS services: AWS Support
