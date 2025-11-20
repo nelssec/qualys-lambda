@@ -10,6 +10,36 @@ Automated scanning of AWS Lambda functions using Qualys QScanner. Triggered by E
 4. Scanner executes qscanner binary against target Lambda
 5. Results sent to Qualys, stored in S3, published to SNS
 
+## Architecture
+
+### Event-Driven Scanning
+EventBridge rules capture Lambda API events from CloudTrail:
+- CreateFunction20150331
+- UpdateFunctionCode20150331v2
+- UpdateFunctionConfiguration20150331v2
+
+### Scanner Lambda
+Python Lambda function with QScanner binary deployed as Lambda Layer or container image. Executes QScanner against target Lambda functions and stores results.
+
+### Deployment Models
+
+**Single Account**: Scanner deployed in one account, scans Lambdas in that account.
+
+**Multi-Account StackSet**: Scanner deployed to each account via CloudFormation StackSet. Each account has independent scanner.
+
+**Centralized Hub-Spoke**: Single scanner in security account. Spoke accounts forward Lambda events to central EventBridge bus. Scanner assumes cross-account roles to scan Lambdas.
+
+### Caching
+DynamoDB stores scan results by CodeSha256 hash. If Lambda code unchanged, scan is skipped. Cache expires after configurable TTL.
+
+### Tagging
+After scanning, Lambda function is tagged with:
+- QualysScanTimestamp - ISO timestamp of the scan
+- QualysScanStatus - "success" or "failed"
+- QualysRepoTag - RepoTag value from QScanner results (e.g., "lambdascan:1763614101")
+
+Tags enable correlation between Lambda functions and their scan results in S3, tracking scan history, and querying by scan status.
+
 ## Deployment
 
 ### Prerequisites
@@ -87,8 +117,6 @@ terraform plan
 terraform apply
 ```
 
-See `terraform/examples/single-region-native/README.md` for detailed instructions.
-
 ## QScanner Command
 
 The scanner executes:
@@ -100,20 +128,6 @@ Environment variables set:
 - AWS_REGION
 - QSCANNER_REGISTRY_USERNAME (optional)
 - QSCANNER_REGISTRY_PASSWORD (optional)
-
-## Deployment Models
-
-### Single Account
-Scanner deployed in one account, scans Lambdas in that account.
-Template: `cloudformation/single-account.yaml` or `single-account-native.yaml`
-
-### Multi-Account StackSet
-Scanner deployed to each account via StackSet.
-Template: `cloudformation/stackset.yaml`
-
-### Centralized Hub-Spoke
-Single scanner in security account, spoke accounts forward events.
-Templates: `centralized-hub.yaml`, `centralized-spoke.yaml`
 
 ## Configuration
 
@@ -144,19 +158,6 @@ Secrets Manager format:
 - SNS notifications for scan completion
 - CloudTrail integration for event capture
 - Multi-region support
-
-### Lambda Tagging
-
-After each scan, the scanner automatically tags the scanned Lambda function with:
-- `QualysScanTimestamp` - ISO timestamp of the scan
-- `QualysScanStatus` - "success" or "failed"
-- `QualysRepoTag` - RepoTag value from QScanner results (e.g., "lambdascan:1763614101")
-
-This allows you to:
-- Correlate Lambda functions with their scan results in S3
-- Track when each Lambda was last scanned
-- Query Lambda functions by scan status
-- Match QScanner reports with specific Lambda functions using RepoTag
 
 ## Supported Qualys PODs
 
