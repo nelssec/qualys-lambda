@@ -45,8 +45,9 @@ Tags enable correlation between Lambda functions and their scan results in S3, t
 ### Prerequisites
 
 - AWS CLI configured with appropriate credentials
-- QScanner binary placed at `scanner-lambda/qscanner.gz` (compressed) or `scanner-lambda/qscanner` (uncompressed)
 - Qualys access token
+
+**Note**: QScanner binary is included in the repository at `scanner-lambda/qscanner.gz` and will be automatically decompressed during deployment.
 
 ### Quick Start
 
