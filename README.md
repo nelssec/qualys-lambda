@@ -24,7 +24,7 @@ The scanner uses DynamoDB to cache results by CodeSha256. If you update a Lambda
 The scanner tags your Lambdas after scanning:
 - `QualysScanTimestamp` - When it was scanned
 - `QualysScanStatus` - `success` or `failed`
-- `QualysRepoTag` - Qualys RepoTag ID for correlation
+- `QualysScanTag` - Qualys scan ID for correlation
 
 ## Deployment
 
@@ -141,7 +141,7 @@ You should see:
 ```json
 {
   "Tags": {
-    "QualysRepoTag": "lambdascan:1763622437",
+    "QualysScanTag": "1763622437",
     "QualysScanStatus": "success",
     "QualysScanTimestamp": "2025-11-20T07:07:35.733587"
   }

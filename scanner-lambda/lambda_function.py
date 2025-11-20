@@ -321,9 +321,11 @@ def tag_lambda_function(function_arn: str, repo_tag: Optional[str], scan_timesta
         }
 
         if repo_tag:
-            tags['QualysRepoTag'] = repo_tag
-            safe_repo_tag = repo_tag[:100] if len(repo_tag) > 100 else repo_tag
-            logger.info(f"Tagging Lambda with RepoTag: {safe_repo_tag}")
+            # Strip "lambdascan:" prefix if present
+            scan_tag = repo_tag.split(':', 1)[1] if ':' in repo_tag else repo_tag
+            tags['QualysScanTag'] = scan_tag
+            safe_scan_tag = scan_tag[:100] if len(scan_tag) > 100 else scan_tag
+            logger.info(f"Tagging Lambda with ScanTag: {safe_scan_tag}")
 
         lambda_client.tag_resource(
             Resource=function_arn,
