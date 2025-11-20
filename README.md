@@ -44,21 +44,10 @@ Tags enable correlation between Lambda functions and their scan results in S3, t
 
 ### Prerequisites
 
-- QScanner binary from Qualys (Linux amd64)
 - AWS CLI configured
 
 ### Deployment
 
-Extract QScanner and place in repository:
-```bash
-cd scanner-lambda
-tar -xzf /path/to/qscanner.tar.gz
-cd ..
-```
-
-The extracted binary must be named `qscanner` and located at `scanner-lambda/qscanner`.
-
-Deploy:
 ```bash
 export QUALYS_ACCESS_TOKEN="your-token"
 make deploy AWS_REGION=us-east-1 QUALYS_POD=US2
@@ -66,7 +55,6 @@ make deploy AWS_REGION=us-east-1 QUALYS_POD=US2
 
 ### Terraform Deployment
 
-Extract QScanner binary to `scanner-lambda/qscanner`, then:
 ```bash
 ./scripts/build-layer.sh
 cd terraform/examples/single-region-native
