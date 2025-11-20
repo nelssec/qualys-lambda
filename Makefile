@@ -27,19 +27,14 @@ help:
 # Build Lambda Layer with QScanner binary
 layer:
 	@echo "Building QScanner Lambda Layer..."
-	@if [ ! -f scanner-lambda/qscanner ]; then \
-		if [ -f scanner-lambda/qscanner.gz ]; then \
-			echo "Decompressing qscanner.gz..."; \
-			gunzip -c scanner-lambda/qscanner.gz > scanner-lambda/qscanner; \
-			chmod +x scanner-lambda/qscanner; \
-		else \
-			echo "ERROR: qscanner binary not found in scanner-lambda/"; \
-			echo "Please download QScanner and place it in scanner-lambda/qscanner.gz or scanner-lambda/qscanner"; \
-			exit 1; \
-		fi; \
+	@if [ ! -f scanner-lambda/qscanner.gz ]; then \
+		echo "ERROR: qscanner.gz not found in scanner-lambda/"; \
+		echo "Please download QScanner and place it in scanner-lambda/qscanner.gz"; \
+		exit 1; \
 	fi
+	@echo "Decompressing qscanner.gz to build/layer/bin/..."
 	@mkdir -p build/layer/bin
-	@cp scanner-lambda/qscanner build/layer/bin/
+	@gunzip -c scanner-lambda/qscanner.gz > build/layer/bin/qscanner
 	@chmod +x build/layer/bin/qscanner
 	@cd build/layer && zip -r ../qscanner-layer.zip .
 	@echo "Layer created: build/qscanner-layer.zip"
