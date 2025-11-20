@@ -22,10 +22,9 @@ Parameters:
       - AU1
       - KSA1
 
-  QualysAccessToken:
+  QualysSecretArn:
     Type: String
-    Description: 'Qualys Access Token (will be stored in Secrets Manager)'
-    NoEcho: true
+    Description: 'ARN of existing Secrets Manager secret containing Qualys credentials'
 
   QScannerLayerArn:
     Type: String
@@ -89,22 +88,6 @@ Conditions:
   CreateScanCache: !Equals [!Ref EnableScanCache, 'true']
 
 Resources:
-  QualysCredentialsSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: !Sub '${AWS::StackName}-qualys-credentials'
-      Description: 'Qualys credentials for Lambda scanner'
-      SecretString: !Sub |
-        {
-          "qualys_pod": "${QualysPod}",
-          "qualys_access_token": "${QualysAccessToken}"
-        }
-      Tags:
-        - Key: Name
-          Value: !Sub '${AWS::StackName}-qualys-credentials'
-        - Key: ManagedBy
-          Value: CloudFormation
-
   ScanResultsBucket:
     Type: AWS::S3::Bucket
     Condition: CreateS3Bucket
@@ -184,15 +167,19 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Sid: ECRAccess
+              - Sid: ECRAuthToken
                 Effect: Allow
                 Action:
                   - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: ECRRepositoryAccess
+                Effect: Allow
+                Action:
                   - ecr:BatchCheckLayerAvailability
                   - ecr:GetDownloadUrlForLayer
                   - ecr:BatchGetImage
                   - ecr:DescribeImages
-                Resource: '*'
+                Resource: !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
               - Sid: LambdaRead
                 Effect: Allow
                 Action:
@@ -203,7 +190,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !GetAtt QualysCredentialsSecret.Id
+                Resource: !Ref QualysSecretArn
               - !If
                 - CreateScanCache
                 - Sid: DynamoDBAccess
@@ -220,7 +207,6 @@ Resources:
                   Effect: Allow
                   Action:
                     - s3:PutObject
-                    - s3:PutObjectAcl
                   Resource: !Sub '${ScanResultsBucket.Arn}/*'
                 - !Ref AWS::NoValue
               - !If
@@ -272,7 +258,7 @@ Resources:
         - !Ref QScannerLayerArn
       Environment:
         Variables:
-          QUALYS_SECRET_ARN: !Ref QualysCredentialsSecret
+          QUALYS_SECRET_ARN: !Ref QualysSecretArn
           RESULTS_S3_BUCKET: !If [CreateS3Bucket, !Ref ScanResultsBucket, '']
           SNS_TOPIC_ARN: !If [CreateSNSTopic, !Ref ScanNotificationsTopic, '']
           SCAN_CACHE_TABLE: !If [CreateScanCache, !Ref ScanCacheTable, '']
@@ -465,12 +451,6 @@ Outputs:
     Value: !GetAtt ScannerLambdaFunction.Arn
     Export:
       Name: !Sub '${AWS::StackName}-ScannerLambdaArn'
-
-  QualysSecretArn:
-    Description: 'ARN of the Qualys credentials secret'
-    Value: !Ref QualysCredentialsSecret
-    Export:
-      Name: !Sub '${AWS::StackName}-QualysSecretArn'
 
   ScanResultsBucketName:
     Description: 'Name of the S3 bucket for scan results'

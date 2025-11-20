@@ -3,6 +3,7 @@ import json
 import boto3
 import subprocess
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
@@ -29,6 +30,37 @@ class ScanException(Exception):
     pass
 
 
+def validate_pod(pod: str) -> bool:
+    """Validate Qualys POD name format"""
+    return bool(re.match(r'^[A-Z0-9]+$', pod))
+
+
+def validate_access_token(token: str) -> bool:
+    """Validate Qualys access token format"""
+    return bool(re.match(r'^[a-zA-Z0-9_-]{20,200}$', token))
+
+
+def validate_function_arn(arn: str) -> bool:
+    """Validate Lambda function ARN format"""
+    pattern = r'^arn:aws:lambda:[a-z0-9-]+:\d{12}:function:[a-zA-Z0-9-_]{1,64}$'
+    return bool(re.match(pattern, arn))
+
+
+def validate_function_name(name: str) -> bool:
+    """Validate Lambda function name"""
+    pattern = r'^[a-zA-Z0-9-_]{1,64}$'
+    return bool(re.match(pattern, name))
+
+
+def sanitize_log_output(output: str) -> str:
+    """Remove potential secrets from log output"""
+    if not output:
+        return ""
+    output = re.sub(r'[a-zA-Z0-9]{32,}', '[REDACTED]', output)
+    output = re.sub(r'(token|password|secret|key)[\s:=]+\S+', r'\1=[REDACTED]', output, flags=re.IGNORECASE)
+    return output
+
+
 def get_qualys_credentials() -> Dict[str, str]:
     response = secrets_manager.get_secret_value(SecretId=QUALYS_SECRET_ARN)
     secret = json.loads(response['SecretString'])
@@ -37,6 +69,12 @@ def get_qualys_credentials() -> Dict[str, str]:
     for field in required_fields:
         if field not in secret:
             raise ValueError(f"Missing required field: {field}")
+
+    if not validate_pod(secret['qualys_pod']):
+        raise ValueError("Invalid POD format")
+
+    if not validate_access_token(secret['qualys_access_token']):
+        raise ValueError("Invalid access token format")
 
     logger.info(f"Retrieved Qualys credentials for pod: {secret['qualys_pod']}")
     return secret
@@ -174,12 +212,11 @@ def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: st
 
         if result.returncode != 0:
             logger.error(f"QScanner failed with exit code {result.returncode}")
-            logger.error(f"STDOUT: {result.stdout}")
-            logger.error(f"STDERR: {result.stderr}")
-            raise ScanException(f"QScanner failed: {result.stderr}")
+            logger.error(f"STDOUT: {sanitize_log_output(result.stdout)}")
+            logger.error(f"STDERR: {sanitize_log_output(result.stderr)}")
+            raise ScanException("QScanner execution failed")
 
         logger.info("QScanner completed successfully")
-        logger.info(f"STDOUT: {result.stdout}")
 
         try:
             scan_results = json.loads(result.stdout) if result.stdout else {}
@@ -251,7 +288,7 @@ def store_results(lambda_details: Dict[str, Any], scan_results: Dict[str, Any]) 
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    logger.info(f"Received event: {json.dumps(event)}")
+    logger.info(f"Received event from source: {event.get('source')}, detail-type: {event.get('detail-type')}")
 
     try:
         if 'detail' not in event:
@@ -263,6 +300,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             function_arn = detail['responseElements'].get('functionArn')
         elif 'requestParameters' in detail:
             function_name = detail['requestParameters'].get('functionName')
+            if function_name and not validate_function_name(function_name):
+                raise ValueError("Invalid function name format")
+
             if function_name:
                 account_id = event.get('account', detail.get('userIdentity', {}).get('accountId'))
                 region = event.get('region', 'us-east-1')
@@ -272,8 +312,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         else:
             raise ValueError("Could not extract function ARN from event")
 
-        if not function_arn:
-            raise ValueError("Function ARN is empty")
+        if not function_arn or not validate_function_arn(function_arn):
+            raise ValueError("Invalid or empty function ARN")
 
         logger.info(f"Processing Lambda function: {function_arn}")
 
@@ -319,7 +359,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'statusCode': 500,
             'body': json.dumps({
                 'message': 'Scan failed',
-                'error': str(e)
+                'request_id': context.request_id
             })
         }
 
@@ -329,6 +369,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'statusCode': 500,
             'body': json.dumps({
                 'message': 'Internal error',
-                'error': str(e)
+                'request_id': context.request_id
             })
         }

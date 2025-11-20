@@ -71,19 +71,37 @@ upload-function: package create-bucket
 	@aws s3 cp build/scanner-function.zip s3://$(S3_BUCKET)/scanner-function.zip
 	@echo "Function code uploaded to s3://$(S3_BUCKET)/scanner-function.zip"
 
-# Deploy stack (native Lambda with Layer)
-deploy: publish-layer upload-function
-	@echo "Deploying CloudFormation stack..."
+# Create Secrets Manager secret (done separately for security)
+create-secret:
+	@echo "Creating Secrets Manager secret..."
 	@if [ -z "$(QUALYS_ACCESS_TOKEN)" ]; then \
 		echo "ERROR: QUALYS_ACCESS_TOKEN environment variable not set"; \
 		exit 1; \
 	fi
+	@SECRET_ARN=$$(aws secretsmanager create-secret \
+		--name "$(STACK_NAME)-qualys-credentials" \
+		--description "Qualys credentials for Lambda scanner" \
+		--secret-string '{"qualys_pod":"$(QUALYS_POD)","qualys_access_token":"$(QUALYS_ACCESS_TOKEN)"}' \
+		--region $(AWS_REGION) \
+		--query ARN \
+		--output text 2>/dev/null || \
+		aws secretsmanager describe-secret \
+		--secret-id "$(STACK_NAME)-qualys-credentials" \
+		--region $(AWS_REGION) \
+		--query ARN \
+		--output text); \
+	echo $$SECRET_ARN > build/secret-arn.txt
+	@echo "Secret ARN: $$(cat build/secret-arn.txt)"
+
+# Deploy stack (native Lambda with Layer)
+deploy: publish-layer upload-function create-secret
+	@echo "Deploying CloudFormation stack..."
 	@aws cloudformation deploy \
 		--template-file cloudformation/single-account-native.yaml \
 		--stack-name $(STACK_NAME) \
 		--parameter-overrides \
 			QualysPod=$(QUALYS_POD) \
-			QualysAccessToken=$(QUALYS_ACCESS_TOKEN) \
+			QualysSecretArn=$$(cat build/secret-arn.txt) \
 			QScannerLayerArn=$$(cat build/layer-arn.txt) \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--region $(AWS_REGION)
