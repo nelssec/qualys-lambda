@@ -45,8 +45,7 @@ Tags enable correlation between Lambda functions and their scan results in S3, t
 ### Prerequisites
 
 - AWS CLI configured
-
-### Deployment
+- QScanner binary included at `scanner-lambda/qscanner`
 
 ```bash
 export QUALYS_ACCESS_TOKEN="your-token"

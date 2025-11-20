@@ -1,7 +1,0 @@
-# QScanner Binary
-#
-# Place QScanner binary here: scanner-lambda/qscanner
-# Extract from Qualys tar.gz: tar -xzf qscanner.tar.gz
-# Commit to repository for customer deployment
-#
-# To update: Replace binary, commit, and push
