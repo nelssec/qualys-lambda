@@ -55,13 +55,12 @@ Tags enable correlation between Lambda functions and their scan results in S3, t
 export QUALYS_ACCESS_TOKEN="your-token-here"
 ```
 
-2. Deploy the scanner (defaults to us-east-1):
+2. Deploy the scanner:
 ```bash
+# Deploy to us-east-1 (default)
 make deploy QUALYS_POD=US2
-```
 
-3. Deploy to a different region:
-```bash
+# Or deploy to a specific region
 make deploy AWS_REGION=us-east-2 QUALYS_POD=US2
 ```
 
@@ -360,21 +359,6 @@ aws dynamodb scan \
   --query 'Items[*].[function_arn.S,scan_timestamp.S]' \
   --output table
 ```
-
-## Costs
-
-Estimated monthly cost for scanning 100 Lambda deployments:
-- Scanner Lambda: $5 (based on 100 invocations at 20s avg)
-- S3 Storage: $1 (scan results, ~1MB per scan)
-- Secrets Manager: $0.40 (1 secret)
-- DynamoDB: $1 (on-demand pricing)
-- CloudWatch Logs: $1 (30-day retention)
-- EventBridge: Free (first 14M events/month)
-- **Total: ~$8.40/month**
-
-Additional costs:
-- CloudTrail: $2 per 100,000 events (if creating new trail)
-- Data transfer: Negligible for normal usage
 
 ## Repository Structure
 
