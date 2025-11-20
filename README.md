@@ -1,121 +1,68 @@
 # Qualys Lambda Scanner
 
-Automated scanning of AWS Lambda functions using Qualys QScanner. Triggered by EventBridge when Lambda functions are deployed or updated.
+Event-driven security scanning for Lambda functions using Qualys QScanner. Watches for Lambda deployments via CloudTrail/EventBridge and automatically scans them.
 
 ## How It Works
 
-1. Lambda function deployed/updated
-2. CloudTrail logs API call
-3. EventBridge triggers scanner Lambda
-4. Scanner executes qscanner binary against target Lambda
-5. Results sent to Qualys, stored in S3, published to SNS
+CloudTrail logs Lambda API calls, EventBridge picks them up and triggers the scanner. The scanner Lambda pulls your function code, runs QScanner against it, and ships results to Qualys while storing copies in S3. It tags your Lambdas with scan metadata so you can track what's been scanned and when.
 
-## Architecture
+The scanner uses DynamoDB to cache results by CodeSha256. If you update a Lambda's environment variables but not the code, it won't re-scan since the hash is identical.
 
-### Event-Driven Scanning
-EventBridge rules capture Lambda API events from CloudTrail:
-- CreateFunction20150331
-- UpdateFunctionCode20150331v2
-- UpdateFunctionConfiguration20150331v2
+## What Gets Deployed
 
-### Scanner Lambda
-Python Lambda function with QScanner binary deployed as Lambda Layer. Executes QScanner against target Lambda functions and stores results.
+`make deploy` creates a CloudFormation stack with:
 
-### Deployment Models
+- **Lambda function** (`qscanner`) - Python 3.11, 2GB RAM, 15min timeout
+- **Lambda Layer** - QScanner binary at `/opt/bin/qscanner`
+- **S3 buckets** - Scan results, Lambda code, build artifacts
+- **DynamoDB table** - Scan cache with TTL (30 days default)
+- **SNS topic** - Scan completion notifications
+- **EventBridge rules** - Trigger on CreateFunction, UpdateFunctionCode, UpdateFunctionConfiguration
+- **Secrets Manager secret** - Qualys credentials (POD + access token)
+- **IAM role** - Scanner permissions
 
-**Single Account**: Scanner deployed in one account, scans Lambdas in that account.
-
-**Multi-Account StackSet**: Scanner deployed to each account via CloudFormation StackSet. Each account has independent scanner.
-
-**Centralized Hub-Spoke**: Single scanner in security account. Spoke accounts forward Lambda events to central EventBridge bus. Scanner assumes cross-account roles to scan Lambdas.
-
-### Caching
-DynamoDB stores scan results by CodeSha256 hash. If Lambda code unchanged, scan is skipped. Cache expires after configurable TTL.
-
-### Tagging
-After scanning, Lambda function is tagged with:
-- QualysScanTimestamp - ISO timestamp of the scan
-- QualysScanStatus - "success" or "failed"
-- QualysRepoTag - RepoTag value from QScanner results (e.g., "lambdascan:1763614101")
-
-Tags enable correlation between Lambda functions and their scan results in S3, tracking scan history, and querying by scan status.
+The scanner tags your Lambdas after scanning:
+- `QualysScanTimestamp` - When it was scanned
+- `QualysScanStatus` - `success` or `failed`
+- `QualysRepoTag` - Qualys RepoTag ID for correlation
 
 ## Deployment
 
-### Prerequisites
+Clone this repo and deploy. The QScanner binary is already included as `scanner-lambda/qscanner.gz` and gets decompressed automatically during the build.
 
-- AWS CLI configured with appropriate credentials
+**Prerequisites:**
+- AWS CLI configured
 - Qualys access token
 
-**Note**: QScanner binary is included in the repository at `scanner-lambda/qscanner.gz` and will be automatically decompressed during deployment.
+**Deploy:**
 
-### Quick Start
-
-1. Set your Qualys access token:
 ```bash
-export QUALYS_ACCESS_TOKEN="your-token-here"
+export QUALYS_ACCESS_TOKEN="your-token"
+make deploy QUALYS_POD=US2 AWS_REGION=us-east-2
 ```
 
-2. Deploy the scanner:
-```bash
-# Deploy to us-east-1 (default)
-make deploy QUALYS_POD=US2
+That's it. The Makefile handles building the layer, uploading to S3, creating the secret, and deploying the stack.
 
-# Or deploy to a specific region
-make deploy AWS_REGION=us-east-2 QUALYS_POD=US2
-```
+**Multi-region:**
 
-### Multi-Region Deployment
-
-Deploy to multiple regions automatically:
 ```bash
 make deploy-multi-region QUALYS_POD=US2
 ```
 
-This deploys to us-east-1, us-west-2, and eu-west-1 by default.
+Deploys to us-east-1, us-west-2, and eu-west-1 by default.
 
-### What Gets Deployed
+## Deployment Models
 
-**CloudFormation Stack**: `qscanner`
+**Single Account** - Deploy the scanner in your account, it scans Lambdas in that account. Simple and effective.
 
-**Lambda Function**: `qscanner`
-- Runtime: Python 3.11
-- Memory: 2048 MB
-- Timeout: 900 seconds
-- Ephemeral Storage: 2048 MB
+**Multi-Account StackSet** - Deploy via CloudFormation StackSet to multiple accounts. Each account gets its own scanner instance.
 
-**Lambda Layer**: `qscanner`
-- Contains QScanner binary at `/opt/bin/qscanner`
-
-**S3 Buckets**:
-- `qscanner-scan-results-{account-id}` - Scan results storage
-- `qscanner-lambda-code-{account-id}` - Lambda function code
-- `qscanner-artifacts-{account-id}` - Build artifacts
-
-**DynamoDB Table**: `qscanner-scan-cache`
-- Caches scan results by function ARN and CodeSha256
-- TTL enabled for automatic cleanup
-
-**SNS Topic**: `qscanner-scan-notifications`
-- Publishes scan completion notifications
-
-**EventBridge Rules**:
-- `qscanner-lambda-create` - Triggers on Lambda creation
-- `qscanner-lambda-update-code` - Triggers on code updates
-- `qscanner-lambda-update-config` - Triggers on configuration updates
-
-**Secrets Manager**: `qscanner-qualys-credentials`
-- Stores Qualys POD and access token
-
-**IAM Role**: `qscanner-role`
-- Permissions for Lambda, Secrets Manager, S3, SNS, DynamoDB
-
-**CloudWatch Logs**: `/aws/lambda/qscanner`
-- Scan execution logs (30 day retention)
+**Centralized Hub-Spoke** - Deploy scanner once in a security account. Spoke accounts forward Lambda events to the central EventBridge bus, scanner assumes roles cross-account. Good for large orgs.
 
 ## QScanner Command
 
-The scanner executes:
+The scanner runs this against each Lambda:
+
 ```bash
 /opt/bin/qscanner \
   --pod US2 \
@@ -127,52 +74,40 @@ The scanner executes:
 ```
 
 Scan types:
-- `pkg` - Package vulnerabilities (includes OS and SCA)
-- `secret` - Secret detection (API keys, credentials, tokens)
+- `pkg` - Package vulnerabilities (OS packages + SCA)
+- `secret` - Hardcoded secrets, API keys, credentials
 
 ## Configuration
 
-### Environment Variables
+**CloudFormation Parameters:**
 
-Scanner Lambda automatically configured with:
-- `QUALYS_SECRET_ARN` - Secrets Manager ARN for credentials
-- `RESULTS_S3_BUCKET` - S3 bucket name for scan results
-- `SNS_TOPIC_ARN` - SNS topic ARN for notifications
-- `SCAN_CACHE_TABLE` - DynamoDB table name for caching
-- `SCAN_TIMEOUT` - Scan timeout in seconds (default: 300)
-- `CACHE_TTL_DAYS` - Cache TTL in days (default: 30)
-- `QSCANNER_PATH` - Path to QScanner binary (/opt/bin/qscanner)
+- `QualysPod` - Your Qualys POD (US1, US2, EU1, etc.)
+- `QualysSecretArn` - Secrets Manager ARN (auto-created by Makefile)
+- `QScannerLayerArn` - Layer ARN (auto-created by Makefile)
+- `EnableS3Results` - Store results in S3 (default: true)
+- `EnableSNSNotifications` - Publish to SNS (default: true)
+- `EnableScanCache` - Use DynamoDB cache (default: true)
+- `CreateCloudTrail` - Create new trail (default: false)
+- `CacheTTLDays` - Cache TTL (default: 30)
+- `ScannerMemorySize` - Lambda memory MB (default: 2048)
+- `ScannerTimeout` - Lambda timeout seconds (default: 900)
 
-### Secrets Manager Format
+**CloudTrail Note:** Only set `CreateCloudTrail=true` if you don't already have a trail logging management events. EventBridge works with any trail in the account. Extra trails cost $2 per 100k events.
+
+**Secrets Manager Format:**
 
 ```json
 {
   "qualys_pod": "US2",
-  "qualys_access_token": "your-access-token-here"
+  "qualys_access_token": "your-token"
 }
 ```
 
-### CloudFormation Parameters
-
-- `QualysPod` - Qualys POD (US1, US2, EU1, etc.)
-- `QualysSecretArn` - ARN of existing Secrets Manager secret
-- `QScannerLayerArn` - ARN of Lambda Layer with QScanner binary
-- `EnableS3Results` - Create S3 bucket for results (default: true)
-- `EnableSNSNotifications` - Create SNS topic (default: true)
-- `EnableScanCache` - Enable DynamoDB caching (default: true)
-- `CreateCloudTrail` - Create new CloudTrail (default: false)
-- `CacheTTLDays` - Cache TTL in days (default: 30)
-- `ScannerMemorySize` - Lambda memory in MB (default: 2048)
-- `ScannerTimeout` - Lambda timeout in seconds (default: 900)
-
-**Note on CloudTrail**: Set `CreateCloudTrail=true` only if you do not have an existing CloudTrail logging management events. EventBridge rules work with any CloudTrail in your account. Creating additional trails costs $2 per 100,000 events.
-
 ## Testing
 
-### Create Test Lambda
+Create a test Lambda:
 
 ```bash
-# Create a simple test function
 echo 'def lambda_handler(event, context): return "Hello"' > /tmp/test.py
 cd /tmp && zip test.zip test.py
 
@@ -181,30 +116,28 @@ aws lambda create-function \
   --runtime python3.11 \
   --handler test.lambda_handler \
   --zip-file fileb://test.zip \
-  --role arn:aws:iam::YOUR-ACCOUNT-ID:role/YOUR-LAMBDA-ROLE \
+  --role arn:aws:iam::ACCOUNT-ID:role/YOUR-LAMBDA-ROLE \
   --region us-east-2
 ```
 
-### View Scanner Logs
+CloudTrail typically takes 5-15 minutes to deliver events to EventBridge, so give it a bit.
+
+**Check logs:**
 
 ```bash
-# Follow logs in real-time
 aws logs tail /aws/lambda/qscanner --region us-east-2 --follow
-
-# View recent logs
-aws logs tail /aws/lambda/qscanner --region us-east-2 --since 30m
 ```
 
-### Check Scan Results
+**Check tags:**
 
-View tags on scanned Lambda:
 ```bash
 aws lambda list-tags \
-  --resource arn:aws:lambda:us-east-2:YOUR-ACCOUNT-ID:function:test-lambda \
+  --resource arn:aws:lambda:us-east-2:ACCOUNT-ID:function:test-lambda \
   --region us-east-2
 ```
 
-Expected output:
+You should see:
+
 ```json
 {
   "Tags": {
@@ -215,19 +148,16 @@ Expected output:
 }
 ```
 
-List scan results in S3:
+**Check S3:**
+
 ```bash
-aws s3 ls s3://qscanner-scan-results-YOUR-ACCOUNT-ID/scans/ --recursive --region us-east-2
+aws s3 ls s3://qscanner-scan-results-ACCOUNT-ID/scans/ --recursive --region us-east-2
 ```
 
-Download specific scan result:
-```bash
-aws s3 cp s3://qscanner-scan-results-YOUR-ACCOUNT-ID/scans/test-lambda/TIMESTAMP.json ./scan-result.json --region us-east-2
-```
+**Force a scan:**
 
-### Manual Scan Trigger
+CloudTrail/EventBridge can be slow. To force an immediate event:
 
-Manually trigger a scan by updating the Lambda:
 ```bash
 aws lambda update-function-configuration \
   --function-name test-lambda \
@@ -235,88 +165,20 @@ aws lambda update-function-configuration \
   --region us-east-2
 ```
 
-The scan will automatically trigger within 5-15 minutes when CloudTrail event reaches EventBridge.
-
-## Maintenance
-
-### Update Scanner Code
-
-```bash
-# Update just the Lambda function code
-make update-function AWS_REGION=us-east-2
-```
-
-### Rebuild Layer
-
-```bash
-# Rebuild QScanner Lambda Layer
-make layer
-```
-
-### Clean Build Artifacts
-
-```bash
-make clean
-```
-
-### Delete Stack
-
-```bash
-aws cloudformation delete-stack --stack-name qscanner --region us-east-2
-```
-
-## Features
-
-- Scans all Lambda functions in account automatically
-- DynamoDB caching prevents duplicate scans (by CodeSha256)
-- Automatic Lambda tagging with scan results and RepoTags
-- Input validation on all credentials and ARNs
-- Log sanitization prevents credential leaks
-- Results stored in S3 with encryption and versioning
-- SNS notifications for scan completion
-- CloudTrail integration for event capture
-- Multi-region support
-- Package vulnerability detection (OS and SCA)
-- Secret detection (API keys, credentials, tokens)
-
-## Supported Qualys PODs
-
-US1, US2, US3, US4, GOV1, EU1, EU2, EU3, IN1, CA1, AE1, UK1, AU1, KSA1
-
-## IAM Permissions
-
-Scanner Lambda role includes:
-- `lambda:GetFunction` - Read Lambda function details
-- `lambda:GetFunctionConfiguration` - Read Lambda configuration
-- `lambda:TagResource` - Tag Lambda with scan results
-- `secretsmanager:GetSecretValue` - Retrieve Qualys credentials
-- `s3:PutObject` - Store scan results in S3
-- `sns:Publish` - Send scan notifications
-- `dynamodb:GetItem`, `dynamodb:PutItem` - Cache management
-- `ecr:GetAuthorizationToken` - ECR authentication (for container Lambda)
-- `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` - Pull container images
-
-## Security
-
-- Credentials stored in Secrets Manager, never in CloudFormation parameters or environment variables
-- Input validation prevents command injection
-- Log output sanitized to prevent credential exposure
-- Least privilege IAM policies
-- S3 buckets encrypted with AES256 and versioned
-- Public access blocked on all S3 buckets
-- DynamoDB with automatic TTL cleanup
-- CloudWatch Logs with 30-day retention
+This creates an UpdateFunctionConfiguration event that triggers the scanner.
 
 ## Troubleshooting
 
-### Scanner Not Triggering
+**Scanner not triggering:**
 
-1. Check EventBridge rules are enabled:
+Check EventBridge rules are enabled:
+
 ```bash
 aws events list-rules --name-prefix qscanner --region us-east-2
 ```
 
-2. Verify CloudTrail is logging Lambda API calls:
+Verify CloudTrail is logging:
+
 ```bash
 aws cloudtrail lookup-events \
   --lookup-attributes AttributeKey=EventName,AttributeValue=UpdateFunctionConfiguration20150331v2 \
@@ -324,27 +186,30 @@ aws cloudtrail lookup-events \
   --max-results 5
 ```
 
-3. Check scanner Lambda logs:
+Check scanner logs:
+
 ```bash
 aws logs tail /aws/lambda/qscanner --region us-east-2 --since 1h
 ```
 
-### Scan Failures
+**Scan failures:**
 
-Check specific error in logs:
+Filter for errors:
+
 ```bash
 aws logs filter-pattern /aws/lambda/qscanner --filter-pattern "ERROR" --region us-east-2
 ```
 
 Common issues:
-- Invalid Qualys credentials - Check Secrets Manager secret
-- Insufficient Lambda permissions - Review IAM role policy
-- QScanner binary missing - Verify Lambda Layer is attached
-- Timeout - Increase Lambda timeout in CloudFormation parameters
+- Bad Qualys credentials - Check the secret in Secrets Manager
+- IAM permission issues - Review the scanner role policy
+- Layer not attached - Verify the Lambda has the qscanner layer
+- Timeouts - Bump the timeout in CloudFormation params
 
-### Cache Issues
+**Cache issues:**
 
-Clear cache for specific function:
+Clear cache for a specific function:
+
 ```bash
 aws dynamodb delete-item \
   --table-name qscanner-scan-cache \
@@ -352,7 +217,8 @@ aws dynamodb delete-item \
   --region us-east-2
 ```
 
-View cache entries:
+View what's cached:
+
 ```bash
 aws dynamodb scan \
   --table-name qscanner-scan-cache \
@@ -361,28 +227,81 @@ aws dynamodb scan \
   --output table
 ```
 
+## Maintenance
+
+**Update scanner code:**
+
+```bash
+make update-function AWS_REGION=us-east-2
+```
+
+**Rebuild layer:**
+
+```bash
+make layer
+```
+
+**Clean build artifacts:**
+
+```bash
+make clean
+```
+
+**Delete stack:**
+
+```bash
+aws cloudformation delete-stack --stack-name qscanner --region us-east-2
+```
+
+## Security
+
+- Credentials live in Secrets Manager, never in environment variables or CloudFormation parameters
+- Input validation on all user-provided strings to prevent command injection
+- Logs are sanitized to prevent credential leakage
+- IAM policies follow least privilege
+- S3 buckets use AES256 encryption, versioning enabled, public access blocked
+- DynamoDB has TTL enabled for automatic cleanup
+- CloudWatch logs retain for 30 days
+
+## IAM Permissions
+
+The scanner role needs:
+
+- `lambda:GetFunction`, `lambda:GetFunctionConfiguration` - Read Lambda details
+- `lambda:TagResource` - Tag Lambdas with scan results
+- `secretsmanager:GetSecretValue` - Pull Qualys credentials
+- `s3:PutObject` - Store scan results
+- `sns:Publish` - Send notifications
+- `dynamodb:GetItem`, `dynamodb:PutItem` - Cache lookups
+- `ecr:GetAuthorizationToken`, `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` - For container-based Lambdas
+
+The ECR permissions are needed because the scanner can scan both Zip and container-based Lambda functions. If your Lambda uses an ECR image, the scanner needs to pull it.
+
+## Supported Qualys PODs
+
+US1, US2, US3, US4, GOV1, EU1, EU2, EU3, IN1, CA1, AE1, UK1, AU1, KSA1
+
 ## Repository Structure
 
 ```
 qualys-lambda/
 ├── scanner-lambda/
-│   ├── lambda_function.py          # Main scanner Lambda code
-│   ├── qscanner.gz                 # Compressed QScanner binary
-│   └── requirements.txt            # Python dependencies (boto3)
+│   ├── lambda_function.py          # Scanner Lambda code
+│   ├── qscanner.gz                 # QScanner binary (compressed)
+│   └── requirements.txt            # Python dependencies
 ├── cloudformation/
-│   ├── single-account-native.yaml  # Single account deployment (primary)
-│   ├── stackset.yaml               # Multi-account StackSet deployment
-│   ├── centralized-hub.yaml        # Centralized hub account scanner
-│   └── centralized-spoke.yaml      # Centralized spoke account forwarder
+│   ├── single-account-native.yaml  # Single account deployment
+│   ├── stackset.yaml               # Multi-account StackSet
+│   ├── centralized-hub.yaml        # Hub account scanner
+│   └── centralized-spoke.yaml      # Spoke account forwarder
 ├── terraform/
 │   ├── modules/
-│   │   └── scanner-native/         # Terraform module for native Lambda
+│   │   └── scanner-native/         # Terraform module
 │   └── examples/
 │       ├── single-region-native/   # Single region example
 │       └── single-account-multi-region/ # Multi-region example
 ├── Makefile                        # Deployment automation
-├── .gitignore                      # Git ignore patterns
-└── README.md                       # This file
+└── README.md
 ```
 
 ## License
