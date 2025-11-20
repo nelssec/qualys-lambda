@@ -367,17 +367,18 @@ qualys-lambda/
 ├── scanner-lambda/
 │   ├── lambda_function.py          # Main scanner Lambda code
 │   ├── qscanner.gz                 # Compressed QScanner binary
-│   └── requirements.txt            # Python dependencies
+│   └── requirements.txt            # Python dependencies (boto3)
 ├── cloudformation/
-│   ├── single-account-native.yaml  # Single account deployment
-│   ├── stackset.yaml               # Multi-account StackSet
-│   ├── centralized-hub.yaml        # Hub account scanner
-│   └── centralized-spoke.yaml      # Spoke account forwarder
+│   ├── single-account-native.yaml  # Single account deployment (primary)
+│   ├── stackset.yaml               # Multi-account StackSet deployment
+│   ├── centralized-hub.yaml        # Centralized hub account scanner
+│   └── centralized-spoke.yaml      # Centralized spoke account forwarder
 ├── terraform/
-│   ├── modules/scanner-native/     # Terraform module
-│   └── examples/                   # Example configurations
-├── scripts/
-│   └── build-layer.sh              # Build Lambda Layer
+│   ├── modules/
+│   │   └── scanner-native/         # Terraform module for native Lambda
+│   └── examples/
+│       ├── single-region-native/   # Single region example
+│       └── single-account-multi-region/ # Multi-region example
 ├── Makefile                        # Deployment automation
 ├── .gitignore                      # Git ignore patterns
 └── README.md                       # This file
