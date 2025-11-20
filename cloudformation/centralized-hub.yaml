@@ -1,0 +1,357 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Qualys Lambda Scanner - Centralized Hub (Security Account)'
+
+Parameters:
+  QualysPod:
+    Type: String
+    Description: 'Qualys POD (e.g., US1, US2, EU1)'
+    Default: 'US2'
+    AllowedValues:
+      - US1
+      - US2
+      - US3
+      - EU1
+      - EU2
+      - IN1
+      - CA1
+      - AE1
+
+  QualysAccessToken:
+    Type: String
+    Description: 'Qualys Access Token (will be stored in Secrets Manager)'
+    NoEcho: true
+
+  ScannerImageUri:
+    Type: String
+    Description: 'ECR URI of the Scanner Lambda container image'
+
+  OrganizationId:
+    Type: String
+    Description: 'AWS Organization ID (e.g., o-xxxxxxxxxx) - used to allow all org accounts to send events'
+    Default: ''
+
+  SpokeAccountIds:
+    Type: CommaDelimitedList
+    Description: 'Comma-separated list of spoke account IDs (leave empty if using OrganizationId)'
+    Default: ''
+
+  EnableS3Results:
+    Type: String
+    Description: 'Create S3 bucket for storing scan results'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableSNSNotifications:
+    Type: String
+    Description: 'Create SNS topic for scan notifications'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  ScannerMemorySize:
+    Type: Number
+    Description: 'Memory size for Scanner Lambda (MB)'
+    Default: 2048
+    MinValue: 512
+    MaxValue: 10240
+
+  ScannerTimeout:
+    Type: Number
+    Description: 'Timeout for Scanner Lambda (seconds)'
+    Default: 900
+    MinValue: 60
+    MaxValue: 900
+
+  ScannerEphemeralStorage:
+    Type: Number
+    Description: 'Ephemeral storage for Scanner Lambda (MB)'
+    Default: 2048
+    MinValue: 512
+    MaxValue: 10240
+
+Conditions:
+  CreateS3Bucket: !Equals [!Ref EnableS3Results, 'true']
+  CreateSNSTopic: !Equals [!Ref EnableSNSNotifications, 'true']
+  UseOrganization: !Not [!Equals [!Ref OrganizationId, '']]
+
+Resources:
+  # Central EventBridge Bus
+  CentralEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${AWS::StackName}-central-bus'
+
+  # EventBridge Bus Policy to allow spoke accounts to send events
+  CentralEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: !Ref CentralEventBus
+      StatementId: AllowSpokeAccountsToPutEvents
+      Statement:
+        Effect: Allow
+        Principal:
+          AWS: !If
+            - UseOrganization
+            - '*'
+            - !Ref SpokeAccountIds
+        Action:
+          - events:PutEvents
+        Resource: !GetAtt CentralEventBus.Arn
+        Condition: !If
+          - UseOrganization
+          - StringEquals:
+              aws:PrincipalOrgID: !Ref OrganizationId
+          - !Ref AWS::NoValue
+
+  # Secrets Manager Secret for Qualys Credentials
+  QualysCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-qualys-credentials'
+      Description: 'Qualys credentials for Lambda scanner'
+      SecretString: !Sub |
+        {
+          "qualys_pod": "${QualysPod}",
+          "qualys_access_token": "${QualysAccessToken}"
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-qualys-credentials'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # S3 Bucket for Scan Results (Optional)
+  ScanResultsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-scan-results-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldScans
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scan-results'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Topic for Notifications (Optional)
+  ScanNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-scan-notifications'
+      DisplayName: 'Qualys Lambda Scan Notifications'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scan-notifications'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # IAM Role for Scanner Lambda to assume roles in spoke accounts
+  ScannerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-scanner-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ScannerLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ECR Permissions (for own account)
+              - Sid: ECRAccess
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                Resource: '*'
+
+              # Lambda Read Permissions (for own account)
+              - Sid: LambdaRead
+                Effect: Allow
+                Action:
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                Resource: !Sub 'arn:aws:lambda:*:${AWS::AccountId}:function:*'
+
+              # Secrets Manager Permissions
+              - Sid: SecretsManagerRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !GetAtt QualysCredentialsSecret.Id
+
+              # STS Assume Role (for cross-account access)
+              - Sid: AssumeRoleInSpokeAccounts
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: 'arn:aws:iam::*:role/qualys-lambda-scanner-spoke-role'
+
+              # S3 Permissions (if enabled)
+              - !If
+                - CreateS3Bucket
+                - Sid: S3Write
+                  Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:PutObjectAcl
+                  Resource: !Sub '${ScanResultsBucket.Arn}/*'
+                - !Ref AWS::NoValue
+
+              # SNS Permissions (if enabled)
+              - !If
+                - CreateSNSTopic
+                - Sid: SNSPublish
+                  Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref ScanNotificationsTopic
+                - !Ref AWS::NoValue
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scanner-lambda-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Log Group for Scanner Lambda
+  ScannerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-scanner'
+      RetentionInDays: 30
+
+  # Scanner Lambda Function
+  ScannerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-scanner'
+      Description: 'Scans Lambda functions using Qualys QScanner (centralized)'
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ScannerImageUri
+      Role: !GetAtt ScannerLambdaRole.Arn
+      MemorySize: !Ref ScannerMemorySize
+      Timeout: !Ref ScannerTimeout
+      EphemeralStorage:
+        Size: !Ref ScannerEphemeralStorage
+      Environment:
+        Variables:
+          QUALYS_SECRET_ARN: !Ref QualysCredentialsSecret
+          RESULTS_S3_BUCKET: !If [CreateS3Bucket, !Ref ScanResultsBucket, '']
+          SNS_TOPIC_ARN: !If [CreateSNSTopic, !Ref ScanNotificationsTopic, '']
+          SCAN_TIMEOUT: '300'
+          CROSS_ACCOUNT_ROLE_NAME: 'qualys-lambda-scanner-spoke-role'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scanner'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # EventBridge Rule on Central Bus
+  CentralEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-central-rule'
+      Description: 'Trigger scanner for Lambda events from all accounts'
+      EventBusName: !Ref CentralEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - lambda.amazonaws.com
+          eventName:
+            - CreateFunction20150331
+            - UpdateFunctionCode20150331v2
+            - UpdateFunctionConfiguration20150331v2
+      Targets:
+        - Arn: !GetAtt ScannerLambdaFunction.Arn
+          Id: ScannerLambdaTarget
+
+  # Permission for EventBridge to invoke Lambda
+  CentralEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScannerLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CentralEventRule.Arn
+
+Outputs:
+  CentralEventBusArn:
+    Description: 'ARN of the central EventBridge bus'
+    Value: !GetAtt CentralEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CentralEventBusArn'
+
+  CentralEventBusName:
+    Description: 'Name of the central EventBridge bus'
+    Value: !Ref CentralEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-CentralEventBusName'
+
+  ScannerLambdaArn:
+    Description: 'ARN of the Scanner Lambda function'
+    Value: !GetAtt ScannerLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ScannerLambdaArn'
+
+  QualysSecretArn:
+    Description: 'ARN of the Qualys credentials secret'
+    Value: !Ref QualysCredentialsSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-QualysSecretArn'
+
+  ScanResultsBucketName:
+    Description: 'Name of the S3 bucket for scan results'
+    Condition: CreateS3Bucket
+    Value: !Ref ScanResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanResultsBucket'
+
+  ScanNotificationsTopicArn:
+    Description: 'ARN of the SNS topic for scan notifications'
+    Condition: CreateSNSTopic
+    Value: !Ref ScanNotificationsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanNotificationsTopic'
+
+  SecurityAccountId:
+    Description: 'Security account ID (for spoke configuration)'
+    Value: !Ref AWS::AccountId
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAccountId'

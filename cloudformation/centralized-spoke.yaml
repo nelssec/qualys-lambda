@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Qualys Lambda Scanner - Centralized Spoke (Member Account)'
+
+Parameters:
+  SecurityAccountId:
+    Type: String
+    Description: 'AWS Account ID of the central security account'
+
+  CentralEventBusName:
+    Type: String
+    Description: 'Name of the central EventBridge bus in the security account'
+    Default: 'qualys-lambda-scanner-central-bus'
+
+  CentralEventBusArn:
+    Type: String
+    Description: 'ARN of the central EventBridge bus in the security account'
+
+Resources:
+  # IAM Role for Scanner Lambda in Hub account to assume
+  SpokeAssumeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'qualys-lambda-scanner-spoke-role'
+      Description: 'Role assumed by central scanner Lambda to scan Lambdas in this account'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${SecurityAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: 'qualys-lambda-scanner'
+      Policies:
+        - PolicyName: LambdaAndECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Lambda Read Permissions
+              - Sid: LambdaRead
+                Effect: Allow
+                Action:
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:ListFunctions
+                  - lambda:ListTags
+                Resource: '*'
+
+              # ECR Permissions (for container-based Lambdas)
+              - Sid: ECRAccess
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                  - ecr:DescribeRepositories
+                Resource: '*'
+
+      Tags:
+        - Key: Name
+          Value: 'qualys-lambda-scanner-spoke-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # EventBridge Rule for Lambda Create
+  LambdaCreateEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'qualys-lambda-scanner-create'
+      Description: 'Forward Lambda create events to central bus'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - lambda.amazonaws.com
+          eventName:
+            - CreateFunction20150331
+      Targets:
+        - Arn: !Ref CentralEventBusArn
+          Id: CentralEventBus
+          RoleArn: !GetAtt EventBridgeForwardRole.Arn
+
+  # EventBridge Rule for Lambda Update Code
+  LambdaUpdateCodeEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'qualys-lambda-scanner-update-code'
+      Description: 'Forward Lambda update code events to central bus'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - lambda.amazonaws.com
+          eventName:
+            - UpdateFunctionCode20150331v2
+      Targets:
+        - Arn: !Ref CentralEventBusArn
+          Id: CentralEventBus
+          RoleArn: !GetAtt EventBridgeForwardRole.Arn
+
+  # EventBridge Rule for Lambda Update Configuration
+  LambdaUpdateConfigEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'qualys-lambda-scanner-update-config'
+      Description: 'Forward Lambda update config events to central bus'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - lambda.amazonaws.com
+          eventName:
+            - UpdateFunctionConfiguration20150331v2
+      Targets:
+        - Arn: !Ref CentralEventBusArn
+          Id: CentralEventBus
+          RoleArn: !GetAtt EventBridgeForwardRole.Arn
+
+  # IAM Role for EventBridge to forward events
+  EventBridgeForwardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'qualys-lambda-scanner-eventbridge-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PutEventsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Ref CentralEventBusArn
+      Tags:
+        - Key: Name
+          Value: 'qualys-lambda-scanner-eventbridge-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudTrail for EventBridge (if not already enabled)
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/cloudtrail/qualys-lambda-scanner'
+      RetentionInDays: 7
+
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'qualys-lambda-scanner-trail-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 7
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: 'qualys-lambda-scanner-trail'
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: false
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogsRole.Arn
+      EventSelectors:
+        - ReadWriteType: WriteOnly
+          IncludeManagementEvents: true
+          DataResources: []
+
+  CloudTrailLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CloudTrailLogGroup.Arn
+
+Outputs:
+  SpokeRoleArn:
+    Description: 'ARN of the role for central scanner to assume'
+    Value: !GetAtt SpokeAssumeRole.Arn
+    Export:
+      Name: 'QualysScannerSpokeRoleArn'
+
+  EventBridgeRoleArn:
+    Description: 'ARN of the EventBridge forwarding role'
+    Value: !GetAtt EventBridgeForwardRole.Arn
+    Export:
+      Name: 'QualysScannerEventBridgeRoleArn'
+
+  CloudTrailName:
+    Description: 'Name of the CloudTrail trail'
+    Value: !Ref CloudTrail
+    Export:
+      Name: 'QualysScannerCloudTrail'
