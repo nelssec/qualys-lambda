@@ -1,0 +1,472 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Qualys Lambda Scanner - Single Account Deployment'
+
+Parameters:
+  QualysPod:
+    Type: String
+    Description: 'Qualys POD (e.g., US1, US2, EU1)'
+    Default: 'US2'
+    AllowedValues:
+      - US1
+      - US2
+      - US3
+      - US4
+      - GOV1
+      - EU1
+      - EU2
+      - EU3
+      - IN1
+      - CA1
+      - AE1
+      - UK1
+      - AU1
+      - KSA1
+
+  QualysAccessToken:
+    Type: String
+    Description: 'Qualys Access Token (will be stored in Secrets Manager)'
+    NoEcho: true
+
+  ScannerImageUri:
+    Type: String
+    Description: 'ECR URI of the Scanner Lambda container image'
+
+  EnableS3Results:
+    Type: String
+    Description: 'Create S3 bucket for storing scan results'
+    Default: 'true'
+    AllowedValues:
+      - US1
+      - US2
+      - US3
+      - US4
+      - GOV1
+      - EU1
+      - EU2
+      - EU3
+      - IN1
+      - CA1
+      - AE1
+      - UK1
+      - AU1
+      - KSA1
+
+  EnableSNSNotifications:
+    Type: String
+    Description: 'Create SNS topic for scan notifications'
+    Default: 'true'
+    AllowedValues:
+      - US1
+      - US2
+      - US3
+      - US4
+      - GOV1
+      - EU1
+      - EU2
+      - EU3
+      - IN1
+      - CA1
+      - AE1
+      - UK1
+      - AU1
+      - KSA1
+
+  ScannerMemorySize:
+    Type: Number
+    Description: 'Memory size for Scanner Lambda (MB)'
+    Default: 2048
+    MinValue: 512
+    MaxValue: 10240
+
+  ScannerTimeout:
+    Type: Number
+    Description: 'Timeout for Scanner Lambda (seconds)'
+    Default: 900
+    MinValue: 60
+    MaxValue: 900
+
+  ScannerEphemeralStorage:
+    Type: Number
+    Description: 'Ephemeral storage for Scanner Lambda (MB)'
+    Default: 2048
+    MinValue: 512
+    MaxValue: 10240
+
+Conditions:
+  CreateS3Bucket: !Equals [!Ref EnableS3Results, 'true']
+  CreateSNSTopic: !Equals [!Ref EnableSNSNotifications, 'true']
+
+Resources:
+  # Secrets Manager Secret for Qualys Credentials
+  QualysCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-qualys-credentials'
+      Description: 'Qualys credentials for Lambda scanner'
+      SecretString: !Sub |
+        {
+          "qualys_pod": "${QualysPod}",
+          "qualys_access_token": "${QualysAccessToken}"
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-qualys-credentials'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # S3 Bucket for Scan Results (Optional)
+  ScanResultsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-scan-results-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldScans
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scan-results'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # SNS Topic for Notifications (Optional)
+  ScanNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-scan-notifications'
+      DisplayName: 'Qualys Lambda Scan Notifications'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scan-notifications'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # IAM Role for Scanner Lambda
+  ScannerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-scanner-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ScannerLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ECR Permissions
+              - Sid: ECRAccess
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                Resource: '*'
+
+              # Lambda Read Permissions
+              - Sid: LambdaRead
+                Effect: Allow
+                Action:
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:TagResource
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+
+              # Secrets Manager Permissions
+              - Sid: SecretsManagerRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !GetAtt QualysCredentialsSecret.Id
+
+              # S3 Permissions (if enabled)
+              - !If
+                - CreateS3Bucket
+                - Sid: S3Write
+                  Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:PutObjectAcl
+                  Resource: !Sub '${ScanResultsBucket.Arn}/*'
+                - !Ref AWS::NoValue
+
+              # SNS Permissions (if enabled)
+              - !If
+                - CreateSNSTopic
+                - Sid: SNSPublish
+                  Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref ScanNotificationsTopic
+                - !Ref AWS::NoValue
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scanner-lambda-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # CloudWatch Log Group for Scanner Lambda
+  ScannerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-scanner'
+      RetentionInDays: 30
+
+  # Scanner Lambda Function
+  ScannerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-scanner'
+      Description: 'Scans Lambda functions using Qualys QScanner'
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ScannerImageUri
+      Role: !GetAtt ScannerLambdaRole.Arn
+      MemorySize: !Ref ScannerMemorySize
+      Timeout: !Ref ScannerTimeout
+      EphemeralStorage:
+        Size: !Ref ScannerEphemeralStorage
+      Environment:
+        Variables:
+          QUALYS_SECRET_ARN: !Ref QualysCredentialsSecret
+          RESULTS_S3_BUCKET: !If [CreateS3Bucket, !Ref ScanResultsBucket, '']
+          SNS_TOPIC_ARN: !If [CreateSNSTopic, !Ref ScanNotificationsTopic, '']
+          SCAN_TIMEOUT: '300'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scanner'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # EventBridge Rule for Lambda Create
+  LambdaCreateEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-lambda-create'
+      Description: 'Trigger scanner when Lambda function is created'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - lambda.amazonaws.com
+          eventName:
+            - CreateFunction20150331
+      Targets:
+        - Arn: !GetAtt ScannerLambdaFunction.Arn
+          Id: ScannerLambdaTarget
+
+  # EventBridge Rule for Lambda Update Code
+  LambdaUpdateCodeEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-lambda-update-code'
+      Description: 'Trigger scanner when Lambda function code is updated'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - lambda.amazonaws.com
+          eventName:
+            - UpdateFunctionCode20150331v2
+      Targets:
+        - Arn: !GetAtt ScannerLambdaFunction.Arn
+          Id: ScannerLambdaTarget
+
+  # EventBridge Rule for Lambda Update Configuration
+  LambdaUpdateConfigEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-lambda-update-config'
+      Description: 'Trigger scanner when Lambda function configuration is updated'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - lambda.amazonaws.com
+          eventName:
+            - UpdateFunctionConfiguration20150331v2
+      Targets:
+        - Arn: !GetAtt ScannerLambdaFunction.Arn
+          Id: ScannerLambdaTarget
+
+  # Permission for EventBridge to invoke Lambda (Create)
+  LambdaCreateEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScannerLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LambdaCreateEventRule.Arn
+
+  # Permission for EventBridge to invoke Lambda (Update Code)
+  LambdaUpdateCodeEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScannerLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LambdaUpdateCodeEventRule.Arn
+
+  # Permission for EventBridge to invoke Lambda (Update Config)
+  LambdaUpdateConfigEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScannerLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LambdaUpdateConfigEventRule.Arn
+
+  # CloudTrail for EventBridge (if not already enabled)
+  # Note: CloudTrail should be enabled for EventBridge to capture Lambda API calls
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cloudtrail/${AWS::StackName}'
+      RetentionInDays: 7
+
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-cloudtrail-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 7
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub '${AWS::StackName}-trail'
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: false
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogsRole.Arn
+      EventSelectors:
+        - ReadWriteType: WriteOnly
+          IncludeManagementEvents: true
+          DataResources: []
+
+  CloudTrailLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CloudTrailLogGroup.Arn
+
+Outputs:
+  ScannerLambdaArn:
+    Description: 'ARN of the Scanner Lambda function'
+    Value: !GetAtt ScannerLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ScannerLambdaArn'
+
+  QualysSecretArn:
+    Description: 'ARN of the Qualys credentials secret'
+    Value: !Ref QualysCredentialsSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-QualysSecretArn'
+
+  ScanResultsBucketName:
+    Description: 'Name of the S3 bucket for scan results'
+    Condition: CreateS3Bucket
+    Value: !Ref ScanResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanResultsBucket'
+
+  ScanNotificationsTopicArn:
+    Description: 'ARN of the SNS topic for scan notifications'
+    Condition: CreateSNSTopic
+    Value: !Ref ScanNotificationsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanNotificationsTopic'
+
+  CloudTrailName:
+    Description: 'Name of the CloudTrail trail'
+    Value: !Ref CloudTrail
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrail'

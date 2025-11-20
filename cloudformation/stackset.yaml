@@ -1,0 +1,372 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Qualys Lambda Scanner - Multi-Account StackSet Deployment'
+
+Parameters:
+  QualysPod:
+    Type: String
+    Description: 'Qualys POD (e.g., US1, US2, EU1)'
+    Default: 'US2'
+    AllowedValues:
+      - US1
+      - US2
+      - US3
+      - US4
+      - GOV1
+      - EU1
+      - EU2
+      - EU3
+      - IN1
+      - CA1
+      - AE1
+      - UK1
+      - AU1
+      - KSA1
+
+  QualysAccessToken:
+    Type: String
+    Description: 'Qualys Access Token (will be stored in Secrets Manager)'
+    NoEcho: true
+
+  ScannerImageUri:
+    Type: String
+    Description: 'ECR URI of the Scanner Lambda container image'
+
+  EnableS3Results:
+    Type: String
+    Description: 'Create S3 bucket for storing scan results'
+    Default: 'true'
+    AllowedValues:
+      - US1
+      - US2
+      - US3
+      - US4
+      - GOV1
+      - EU1
+      - EU2
+      - EU3
+      - IN1
+      - CA1
+      - AE1
+      - UK1
+      - AU1
+      - KSA1
+
+  EnableSNSNotifications:
+    Type: String
+    Description: 'Create SNS topic for scan notifications'
+    Default: 'true'
+    AllowedValues:
+      - US1
+      - US2
+      - US3
+      - US4
+      - GOV1
+      - EU1
+      - EU2
+      - EU3
+      - IN1
+      - CA1
+      - AE1
+      - UK1
+      - AU1
+      - KSA1
+
+  ScannerMemorySize:
+    Type: Number
+    Description: 'Memory size for Scanner Lambda (MB)'
+    Default: 2048
+    MinValue: 512
+    MaxValue: 10240
+
+  ScannerTimeout:
+    Type: Number
+    Description: 'Timeout for Scanner Lambda (seconds)'
+    Default: 900
+    MinValue: 60
+    MaxValue: 900
+
+  ScannerEphemeralStorage:
+    Type: Number
+    Description: 'Ephemeral storage for Scanner Lambda (MB)'
+    Default: 2048
+    MinValue: 512
+    MaxValue: 10240
+
+Conditions:
+  CreateS3Bucket: !Equals [!Ref EnableS3Results, 'true']
+  CreateSNSTopic: !Equals [!Ref EnableSNSNotifications, 'true']
+
+Resources:
+  # Secrets Manager Secret for Qualys Credentials
+  QualysCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: 'qualys-lambda-scanner-credentials'
+      Description: 'Qualys credentials for Lambda scanner'
+      SecretString: !Sub |
+        {
+          "qualys_pod": "${QualysPod}",
+          "qualys_access_token": "${QualysAccessToken}"
+        }
+      Tags:
+        - Key: Name
+          Value: 'qualys-lambda-scanner-credentials'
+        - Key: ManagedBy
+          Value: CloudFormation-StackSet
+
+  # S3 Bucket for Scan Results (Optional)
+  ScanResultsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Bucket
+    Properties:
+      BucketName: !Sub 'qualys-lambda-scan-results-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldScans
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: 'qualys-lambda-scan-results'
+        - Key: ManagedBy
+          Value: CloudFormation-StackSet
+
+  # SNS Topic for Notifications (Optional)
+  ScanNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: 'qualys-lambda-scan-notifications'
+      DisplayName: 'Qualys Lambda Scan Notifications'
+      Tags:
+        - Key: Name
+          Value: 'qualys-lambda-scan-notifications'
+        - Key: ManagedBy
+          Value: CloudFormation-StackSet
+
+  # IAM Role for Scanner Lambda
+  ScannerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'qualys-lambda-scanner-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ScannerLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ECR Permissions
+              - Sid: ECRAccess
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                Resource: '*'
+
+              # Lambda Read Permissions
+              - Sid: LambdaRead
+                Effect: Allow
+                Action:
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:TagResource
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+
+              # Secrets Manager Permissions
+              - Sid: SecretsManagerRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !GetAtt QualysCredentialsSecret.Id
+
+              # S3 Permissions (if enabled)
+              - !If
+                - CreateS3Bucket
+                - Sid: S3Write
+                  Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:PutObjectAcl
+                  Resource: !Sub '${ScanResultsBucket.Arn}/*'
+                - !Ref AWS::NoValue
+
+              # SNS Permissions (if enabled)
+              - !If
+                - CreateSNSTopic
+                - Sid: SNSPublish
+                  Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref ScanNotificationsTopic
+                - !Ref AWS::NoValue
+
+      Tags:
+        - Key: Name
+          Value: 'qualys-lambda-scanner-role'
+        - Key: ManagedBy
+          Value: CloudFormation-StackSet
+
+  # CloudWatch Log Group for Scanner Lambda
+  ScannerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/lambda/qualys-lambda-scanner'
+      RetentionInDays: 30
+
+  # Scanner Lambda Function
+  ScannerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'qualys-lambda-scanner'
+      Description: 'Scans Lambda functions using Qualys QScanner'
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ScannerImageUri
+      Role: !GetAtt ScannerLambdaRole.Arn
+      MemorySize: !Ref ScannerMemorySize
+      Timeout: !Ref ScannerTimeout
+      EphemeralStorage:
+        Size: !Ref ScannerEphemeralStorage
+      Environment:
+        Variables:
+          QUALYS_SECRET_ARN: !Ref QualysCredentialsSecret
+          RESULTS_S3_BUCKET: !If [CreateS3Bucket, !Ref ScanResultsBucket, '']
+          SNS_TOPIC_ARN: !If [CreateSNSTopic, !Ref ScanNotificationsTopic, '']
+          SCAN_TIMEOUT: '300'
+      Tags:
+        - Key: Name
+          Value: 'qualys-lambda-scanner'
+        - Key: ManagedBy
+          Value: CloudFormation-StackSet
+
+  # EventBridge Rule for Lambda Create
+  LambdaCreateEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'qualys-lambda-scanner-create'
+      Description: 'Trigger scanner when Lambda function is created'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - lambda.amazonaws.com
+          eventName:
+            - CreateFunction20150331
+      Targets:
+        - Arn: !GetAtt ScannerLambdaFunction.Arn
+          Id: ScannerLambdaTarget
+
+  # EventBridge Rule for Lambda Update Code
+  LambdaUpdateCodeEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'qualys-lambda-scanner-update-code'
+      Description: 'Trigger scanner when Lambda function code is updated'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - lambda.amazonaws.com
+          eventName:
+            - UpdateFunctionCode20150331v2
+      Targets:
+        - Arn: !GetAtt ScannerLambdaFunction.Arn
+          Id: ScannerLambdaTarget
+
+  # EventBridge Rule for Lambda Update Configuration
+  LambdaUpdateConfigEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'qualys-lambda-scanner-update-config'
+      Description: 'Trigger scanner when Lambda function configuration is updated'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - lambda.amazonaws.com
+          eventName:
+            - UpdateFunctionConfiguration20150331v2
+      Targets:
+        - Arn: !GetAtt ScannerLambdaFunction.Arn
+          Id: ScannerLambdaTarget
+
+  # Permission for EventBridge to invoke Lambda (Create)
+  LambdaCreateEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScannerLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LambdaCreateEventRule.Arn
+
+  # Permission for EventBridge to invoke Lambda (Update Code)
+  LambdaUpdateCodeEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScannerLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LambdaUpdateCodeEventRule.Arn
+
+  # Permission for EventBridge to invoke Lambda (Update Config)
+  LambdaUpdateConfigEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScannerLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt LambdaUpdateConfigEventRule.Arn
+
+Outputs:
+  ScannerLambdaArn:
+    Description: 'ARN of the Scanner Lambda function'
+    Value: !GetAtt ScannerLambdaFunction.Arn
+
+  QualysSecretArn:
+    Description: 'ARN of the Qualys credentials secret'
+    Value: !Ref QualysCredentialsSecret
+
+  ScanResultsBucketName:
+    Description: 'Name of the S3 bucket for scan results'
+    Condition: CreateS3Bucket
+    Value: !Ref ScanResultsBucket
+
+  ScanNotificationsTopicArn:
+    Description: 'ARN of the SNS topic for scan notifications'
+    Condition: CreateSNSTopic
+    Value: !Ref ScanNotificationsTopic

@@ -1,0 +1,17 @@
+# Example terraform.tfvars file
+# Copy this to terraform.tfvars and fill in your values
+
+regions = ["us-east-1", "us-west-2", "eu-west-1"]
+
+qualys_pod = "US2"
+
+# Store this securely (use environment variable or secrets manager)
+# qualys_access_token = "your-token-here"
+
+# ECR image URIs for each region
+# Images must be replicated to each region's ECR
+scanner_image_uri_map = {
+  "us-east-1" = "123456789012.dkr.ecr.us-east-1.amazonaws.com/qualys-lambda-scanner:latest"
+  "us-west-2" = "123456789012.dkr.ecr.us-west-2.amazonaws.com/qualys-lambda-scanner:latest"
+  "eu-west-1" = "123456789012.dkr.ecr.eu-west-1.amazonaws.com/qualys-lambda-scanner:latest"
+}
