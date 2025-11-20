@@ -22,7 +22,6 @@ RESULTS_S3_BUCKET = os.environ.get('RESULTS_S3_BUCKET')
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
 SCAN_CACHE_TABLE = os.environ.get('SCAN_CACHE_TABLE')
 
-# Parse integer environment variables with error handling
 try:
     SCAN_TIMEOUT = int(os.environ.get('SCAN_TIMEOUT', '300'))
 except ValueError:
@@ -80,7 +79,6 @@ def validate_tag_value(value: str) -> bool:
     if len(value) > 256:
         return False
 
-    # AWS allows: a-z, A-Z, 0-9, spaces, and + - = . _ : / @
     pattern = r'^[a-zA-Z0-9 +\-=._:/@]+$'
     return bool(re.match(pattern, value))
 
@@ -281,16 +279,13 @@ def extract_repo_tags(scan_results: Dict[str, Any]) -> Optional[str]:
         if 'results' in scan_results and isinstance(scan_results['results'], dict):
             results = scan_results['results']
 
-            # Check for RepoTags in the results structure
             if 'RepoTags' in results and isinstance(results['RepoTags'], list) and results['RepoTags']:
                 repo_tag = results['RepoTags'][0]
 
-            # Sometimes RepoTags might be nested deeper in the structure
             elif 'image' in results and isinstance(results['image'], dict):
                 if 'RepoTags' in results['image'] and isinstance(results['image']['RepoTags'], list) and results['image']['RepoTags']:
                     repo_tag = results['image']['RepoTags'][0]
 
-        # Try parsing stdout if results is raw
         if not repo_tag and 'stdout' in scan_results and scan_results['stdout']:
             try:
                 stdout_json = json.loads(scan_results['stdout'])
@@ -303,7 +298,6 @@ def extract_repo_tags(scan_results: Dict[str, Any]) -> Optional[str]:
             logger.warning("No RepoTags found in scan results")
             return None
 
-        # Validate RepoTag before returning
         if not validate_tag_value(repo_tag):
             logger.warning(f"Invalid RepoTag format or length, skipping tag (length: {len(repo_tag)})")
             return None
@@ -325,7 +319,6 @@ def tag_lambda_function(function_arn: str, repo_tag: Optional[str], scan_timesta
 
         if repo_tag:
             tags['QualysRepoTag'] = repo_tag
-            # Sanitize RepoTag before logging (even though it's validated)
             safe_repo_tag = repo_tag[:100] if len(repo_tag) > 100 else repo_tag
             logger.info(f"Tagging Lambda with RepoTag: {safe_repo_tag}")
 
@@ -385,7 +378,6 @@ def store_results(lambda_details: Dict[str, Any], scan_results: Dict[str, Any]) 
         except Exception as e:
             logger.error(f"Failed to send SNS notification: {e}")
 
-    # Tag the Lambda function with scan results
     repo_tag = extract_repo_tags(scan_results)
     tag_lambda_function(lambda_details['function_arn'], repo_tag, timestamp, scan_results['success'])
 
