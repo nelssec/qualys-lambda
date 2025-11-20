@@ -66,6 +66,29 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
+### Using Terraform
+
+For infrastructure-as-code deployment with Terraform:
+
+```bash
+# 1. Build Lambda Layer
+./scripts/build-layer.sh
+
+# 2. Navigate to Terraform example
+cd terraform/examples/single-region-native
+
+# 3. Configure variables
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with your Qualys credentials
+
+# 4. Deploy
+terraform init
+terraform plan
+terraform apply
+```
+
+See `terraform/examples/single-region-native/README.md` for detailed instructions.
+
 ## QScanner Command
 
 The scanner executes:
@@ -176,19 +199,29 @@ Estimated monthly cost for 100 Lambda deployments:
 ```
 qualys-lambda/
 ├── scanner-lambda/
-│   ├── lambda_function.py
-│   ├── Dockerfile
-│   └── requirements.txt
+│   ├── lambda_function.py    # Main scanner Lambda handler
+│   ├── Dockerfile            # Docker image for container deployment
+│   └── requirements.txt      # Python dependencies
 ├── cloudformation/
-│   ├── single-account.yaml
-│   ├── single-account-native.yaml
-│   ├── stackset.yaml
-│   ├── centralized-hub.yaml
-│   └── centralized-spoke.yaml
+│   ├── single-account.yaml           # Docker-based deployment
+│   ├── single-account-native.yaml    # Lambda Layer deployment
+│   ├── stackset.yaml                 # Multi-account StackSet
+│   ├── centralized-hub.yaml          # Hub account template
+│   └── centralized-spoke.yaml        # Spoke account template
 ├── terraform/
 │   ├── modules/
+│   │   └── scanner-native/           # Native Terraform module
+│   │       ├── main.tf
+│   │       ├── variables.tf
+│   │       └── outputs.tf
 │   └── examples/
-├── Makefile
+│       └── single-region-native/     # Example deployment
+│           ├── main.tf
+│           ├── variables.tf
+│           └── README.md
+├── scripts/
+│   └── build-layer.sh        # Build Lambda Layer
+├── Makefile                  # Build automation
 └── README.md
 ```
 
