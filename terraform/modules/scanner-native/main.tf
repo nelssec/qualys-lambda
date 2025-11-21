@@ -252,6 +252,22 @@ resource "aws_iam_role_policy" "scanner_lambda" {
           "secretsmanager:GetSecretValue"
         ]
         Resource = aws_secretsmanager_secret.qualys_credentials.arn
+      },
+      {
+        Sid    = "SQSDeadLetterQueue"
+        Effect = "Allow"
+        Action = [
+          "sqs:SendMessage"
+        ]
+        Resource = aws_sqs_queue.scanner_dlq.arn
+      },
+      {
+        Sid    = "CloudWatchMetrics"
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:PutMetricData"
+        ]
+        Resource = "*"
       }
       ],
       var.enable_scan_cache ? [{
@@ -290,6 +306,20 @@ resource "aws_iam_role_policy_attachment" "scanner_lambda_basic" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
+# SQS Dead Letter Queue for Scanner Lambda
+resource "aws_sqs_queue" "scanner_dlq" {
+  name                      = "${var.stack_name}-scanner-dlq"
+  message_retention_seconds = 1209600 # 14 days
+
+  tags = merge(
+    var.tags,
+    {
+      Name      = "${var.stack_name}-scanner-dlq"
+      ManagedBy = "Terraform"
+    }
+  )
+}
+
 # Scanner Lambda Function
 resource "aws_lambda_function" "scanner" {
   filename         = data.archive_file.lambda_function.output_path
@@ -302,6 +332,10 @@ resource "aws_lambda_function" "scanner" {
   timeout          = var.scanner_timeout
 
   layers = [aws_lambda_layer_version.qscanner.arn]
+
+  dead_letter_config {
+    target_arn = aws_sqs_queue.scanner_dlq.arn
+  }
 
   ephemeral_storage {
     size = var.scanner_ephemeral_storage
@@ -479,9 +513,20 @@ resource "aws_cloudtrail" "main" {
   cloud_watch_logs_group_arn    = "${aws_cloudwatch_log_group.cloudtrail.arn}:*"
   cloud_watch_logs_role_arn     = aws_iam_role.cloudtrail_logs.arn
 
-  event_selector {
-    read_write_type           = "WriteOnly"
-    include_management_events = true
+  # Use advanced event selectors to only log Lambda management events
+  # This reduces CloudTrail costs by avoiding ALL management events from all services
+  advanced_event_selector {
+    name = "LambdaManagementEvents"
+
+    field_selector {
+      field  = "eventCategory"
+      equals = ["Management"]
+    }
+
+    field_selector {
+      field  = "resources.type"
+      equals = ["AWS::Lambda::Function"]
+    }
   }
 
   depends_on = [
@@ -498,6 +543,8 @@ resource "aws_cloudtrail" "main" {
 }
 
 # EventBridge Rules
+# Note: Self-scan prevention is handled at the code level in lambda_function.py
+# This provides more reliable filtering than EventBridge pattern matching
 resource "aws_cloudwatch_event_rule" "lambda_create" {
   name        = "${var.stack_name}-lambda-create"
   description = "Trigger scanner when Lambda function is created"
@@ -604,6 +651,115 @@ resource "aws_lambda_permission" "lambda_update_config" {
   function_name = aws_lambda_function.scanner.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.lambda_update_config.arn
+}
+
+# CloudWatch Alarms for monitoring scanner health
+resource "aws_cloudwatch_metric_alarm" "scanner_errors" {
+  alarm_name          = "${var.stack_name}-scanner-errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = "300"
+  statistic           = "Sum"
+  threshold           = "5"
+  alarm_description   = "Scanner Lambda has errors"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    FunctionName = aws_lambda_function.scanner.function_name
+  }
+
+  alarm_actions = var.enable_sns_notifications ? [aws_sns_topic.scan_notifications[0].arn] : []
+
+  tags = merge(
+    var.tags,
+    {
+      Name      = "${var.stack_name}-scanner-errors"
+      ManagedBy = "Terraform"
+    }
+  )
+}
+
+resource "aws_cloudwatch_metric_alarm" "scanner_throttles" {
+  alarm_name          = "${var.stack_name}-scanner-throttles"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "Throttles"
+  namespace           = "AWS/Lambda"
+  period              = "300"
+  statistic           = "Sum"
+  threshold           = "1"
+  alarm_description   = "Scanner Lambda is being throttled"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    FunctionName = aws_lambda_function.scanner.function_name
+  }
+
+  alarm_actions = var.enable_sns_notifications ? [aws_sns_topic.scan_notifications[0].arn] : []
+
+  tags = merge(
+    var.tags,
+    {
+      Name      = "${var.stack_name}-scanner-throttles"
+      ManagedBy = "Terraform"
+    }
+  )
+}
+
+resource "aws_cloudwatch_metric_alarm" "scanner_dlq_messages" {
+  alarm_name          = "${var.stack_name}-scanner-dlq-messages"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = "60"
+  statistic           = "Average"
+  threshold           = "0"
+  alarm_description   = "Messages in scanner DLQ - indicates failed scans"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    QueueName = aws_sqs_queue.scanner_dlq.name
+  }
+
+  alarm_actions = var.enable_sns_notifications ? [aws_sns_topic.scan_notifications[0].arn] : []
+
+  tags = merge(
+    var.tags,
+    {
+      Name      = "${var.stack_name}-scanner-dlq-messages"
+      ManagedBy = "Terraform"
+    }
+  )
+}
+
+resource "aws_cloudwatch_metric_alarm" "scanner_duration" {
+  alarm_name          = "${var.stack_name}-scanner-duration"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "Duration"
+  namespace           = "AWS/Lambda"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = tostring(var.scanner_timeout * 1000 * 0.8) # 80% of timeout
+  alarm_description   = "Scanner Lambda approaching timeout threshold"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    FunctionName = aws_lambda_function.scanner.function_name
+  }
+
+  alarm_actions = var.enable_sns_notifications ? [aws_sns_topic.scan_notifications[0].arn] : []
+
+  tags = merge(
+    var.tags,
+    {
+      Name      = "${var.stack_name}-scanner-duration"
+      ManagedBy = "Terraform"
+    }
+  )
 }
 
 # Data sources

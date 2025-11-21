@@ -51,6 +51,16 @@ make deploy-multi-region QUALYS_POD=US2
 
 Deploys to us-east-1, us-west-2, and eu-west-1 by default.
 
+**Important: Direct CloudFormation Deployment**
+
+The CloudFormation template (`cloudformation/single-account-native.yaml`) contains placeholder code in the Lambda function definition. **You must use the Makefile for deployment** as it handles packaging and uploading the actual Lambda function code to S3.
+
+If you need to deploy directly with CloudFormation (without the Makefile), you must:
+1. Build and upload the Lambda function code to S3 manually
+2. Modify the CloudFormation template to reference the S3 bucket/key instead of using inline ZipFile code
+
+For Terraform deployments, the module handles this automatically via the `archive_file` data source.
+
 ## Deployment Models
 
 **Single Account** - Deploy the scanner in your account, it scans Lambdas in that account. Simple and effective.
