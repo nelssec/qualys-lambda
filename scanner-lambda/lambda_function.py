@@ -4,6 +4,7 @@ import boto3
 import subprocess
 import logging
 import re
+import glob
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
@@ -252,14 +253,28 @@ def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: st
 
         logger.info("QScanner completed successfully")
 
+        # Read QScanner output files from /tmp/qscanner-output/
+        scan_results = {}
+        output_dir = '/tmp/qscanner-output'
+
         try:
-            scan_results = json.loads(result.stdout) if result.stdout else {}
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse QScanner output as JSON")
-            scan_results = {
-                'raw_output': result.stdout,
-                'stderr': result.stderr
-            }
+            # Look for *-ScanResult.json file
+            import glob
+            scan_result_files = glob.glob(f'{output_dir}/*-ScanResult.json')
+
+            if scan_result_files:
+                scan_result_file = scan_result_files[0]
+                logger.info(f"Reading scan results from: {scan_result_file}")
+
+                with open(scan_result_file, 'r') as f:
+                    scan_results = json.load(f)
+            else:
+                logger.warning("No ScanResult.json file found in output directory")
+                scan_results = {}
+
+        except Exception as e:
+            logger.warning(f"Failed to read QScanner output files: {e}")
+            scan_results = {}
 
         return {
             'success': True,
@@ -274,51 +289,50 @@ def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: st
         raise ScanException(f"Scan timeout after {SCAN_TIMEOUT} seconds")
 
 
-def extract_repo_tags(scan_results: Dict[str, Any], scan_timestamp: str) -> str:
-    """Extract and validate RepoTags from scan results JSON, or generate one"""
+def extract_repo_tags(scan_results: Dict[str, Any], scan_timestamp: str) -> Optional[str]:
+    """Extract RepoTags from Metadata.TargetMetadata.ImageMetadata in scan results JSON"""
     try:
-        repo_tag = None
+        if 'results' not in scan_results or not isinstance(scan_results['results'], dict):
+            logger.warning("No results found in scan_results")
+            return None
 
-        if 'results' in scan_results and isinstance(scan_results['results'], dict):
-            results = scan_results['results']
+        results = scan_results['results']
 
-            if 'RepoTags' in results and isinstance(results['RepoTags'], list) and results['RepoTags']:
-                repo_tag = results['RepoTags'][0]
+        # Only check Metadata.TargetMetadata.ImageMetadata.RepoTags (QScanner output structure)
+        if 'Metadata' not in results or not isinstance(results['Metadata'], dict):
+            logger.warning("No Metadata found in scan results")
+            return None
 
-            elif 'image' in results and isinstance(results['image'], dict):
-                if 'RepoTags' in results['image'] and isinstance(results['image']['RepoTags'], list) and results['image']['RepoTags']:
-                    repo_tag = results['image']['RepoTags'][0]
+        metadata = results['Metadata']
+        if 'TargetMetadata' not in metadata or not isinstance(metadata['TargetMetadata'], dict):
+            logger.warning("No TargetMetadata found in Metadata")
+            return None
 
-        if not repo_tag and 'stdout' in scan_results and scan_results['stdout']:
-            try:
-                stdout_json = json.loads(scan_results['stdout'])
-                if 'RepoTags' in stdout_json and isinstance(stdout_json['RepoTags'], list) and stdout_json['RepoTags']:
-                    repo_tag = stdout_json['RepoTags'][0]
-            except json.JSONDecodeError:
-                pass
+        target_metadata = metadata['TargetMetadata']
+        if 'ImageMetadata' not in target_metadata or not isinstance(target_metadata['ImageMetadata'], dict):
+            logger.warning("No ImageMetadata found in TargetMetadata")
+            return None
 
-        if not repo_tag:
-            # Generate RepoTag from scan timestamp for Zip-based Lambdas
-            scan_epoch = int(datetime.fromisoformat(scan_timestamp).timestamp())
-            repo_tag = f"lambdascan:{scan_epoch}"
-            logger.info(f"Generated RepoTag: {repo_tag}")
+        repo_tags = target_metadata['ImageMetadata'].get('RepoTags', [])
+        if not isinstance(repo_tags, list) or not repo_tags:
+            logger.warning("No RepoTags found in ImageMetadata")
+            return None
+
+        repo_tag = repo_tags[0]
+        logger.info(f"Found RepoTag in Metadata.TargetMetadata.ImageMetadata: {repo_tag}")
 
         if not validate_tag_value(repo_tag):
-            logger.warning(f"Invalid RepoTag format or length, skipping tag (length: {len(repo_tag)})")
-            # Fallback to timestamp-based tag
-            scan_epoch = int(datetime.fromisoformat(scan_timestamp).timestamp())
-            repo_tag = f"lambdascan:{scan_epoch}"
+            logger.warning(f"Invalid RepoTag format or length: {repo_tag} (length: {len(repo_tag)})")
+            return None
 
         return repo_tag
 
     except Exception as e:
         logger.error(f"Error extracting RepoTags: {e}")
-        # Fallback to timestamp-based tag
-        scan_epoch = int(datetime.fromisoformat(scan_timestamp).timestamp())
-        return f"lambdascan:{scan_epoch}"
+        return None
 
 
-def tag_lambda_function(function_arn: str, repo_tag: str, scan_timestamp: str, scan_success: bool) -> None:
+def tag_lambda_function(function_arn: str, repo_tag: Optional[str], scan_timestamp: str, scan_success: bool) -> None:
     """Tag Lambda function with scan results"""
     try:
         tags = {
@@ -326,11 +340,15 @@ def tag_lambda_function(function_arn: str, repo_tag: str, scan_timestamp: str, s
             'QualysScanStatus': 'success' if scan_success else 'failed'
         }
 
-        # Extract just the timestamp portion (strip "lambdascan:" prefix if present)
-        scan_tag = repo_tag.split(':', 1)[1] if ':' in repo_tag else repo_tag
-        safe_scan_tag = scan_tag[:100] if len(scan_tag) > 100 else scan_tag
-        tags['QualysScanTag'] = safe_scan_tag
-        logger.info(f"Tagging Lambda with ScanTag: {safe_scan_tag}")
+        # Only add QualysScanTag if repo_tag was found
+        if repo_tag:
+            # Extract just the timestamp portion (strip "lambdascan:" prefix if present)
+            scan_tag = repo_tag.split(':', 1)[1] if ':' in repo_tag else repo_tag
+            safe_scan_tag = scan_tag[:100] if len(scan_tag) > 100 else scan_tag
+            tags['QualysScanTag'] = safe_scan_tag
+            logger.info(f"Tagging Lambda with ScanTag: {safe_scan_tag}")
+        else:
+            logger.info("No RepoTag found, skipping QualysScanTag")
 
         lambda_client.tag_resource(
             Resource=function_arn,
