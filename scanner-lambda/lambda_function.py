@@ -5,6 +5,7 @@ import subprocess
 import logging
 import re
 import glob
+import time
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
@@ -16,6 +17,7 @@ secrets_manager = boto3.client('secretsmanager')
 s3_client = boto3.client('s3')
 sns_client = boto3.client('sns')
 sts_client = boto3.client('sts')
+cloudwatch = boto3.client('cloudwatch')
 dynamodb = boto3.resource('dynamodb')
 
 QUALYS_SECRET_ARN = os.environ.get('QUALYS_SECRET_ARN')
@@ -91,6 +93,55 @@ def sanitize_log_output(output: str) -> str:
     output = re.sub(r'[a-zA-Z0-9]{32,}', '[REDACTED]', output)
     output = re.sub(r'(token|password|secret|key)[\s:=]+\S+', r'\1=[REDACTED]', output, flags=re.IGNORECASE)
     return output
+
+
+def publish_custom_metrics(metric_data: Dict[str, Any]) -> None:
+    """Publish custom CloudWatch metrics for scan statistics"""
+    try:
+        metrics = []
+        namespace = 'QualysLambdaScanner'
+
+        # Scan success/failure metric
+        if 'scan_success' in metric_data:
+            metrics.append({
+                'MetricName': 'ScanSuccess',
+                'Value': 1 if metric_data['scan_success'] else 0,
+                'Unit': 'Count'
+            })
+
+        # Scan duration metric
+        if 'scan_duration' in metric_data:
+            metrics.append({
+                'MetricName': 'ScanDuration',
+                'Value': metric_data['scan_duration'],
+                'Unit': 'Seconds'
+            })
+
+        # Cache hit rate metric
+        if 'cache_hit' in metric_data:
+            metrics.append({
+                'MetricName': 'CacheHit',
+                'Value': 1 if metric_data['cache_hit'] else 0,
+                'Unit': 'Count'
+            })
+
+        # Vulnerability count metric
+        if 'vulnerability_count' in metric_data:
+            metrics.append({
+                'MetricName': 'VulnerabilityCount',
+                'Value': metric_data['vulnerability_count'],
+                'Unit': 'Count'
+            })
+
+        if metrics:
+            cloudwatch.put_metric_data(
+                Namespace=namespace,
+                MetricData=metrics
+            )
+            logger.info(f"Published {len(metrics)} custom metrics to CloudWatch")
+
+    except Exception as e:
+        logger.error(f"Failed to publish custom metrics: {e}")
 
 
 def get_qualys_credentials() -> Dict[str, str]:
@@ -209,6 +260,36 @@ def get_lambda_details(function_arn: str, cross_account_role: Optional[str] = No
         'memory_size': function_config.get('MemorySize'),
         'timeout': function_config.get('Timeout'),
     }
+
+
+def retry_with_backoff(func, max_retries=3, initial_delay=2):
+    """Retry a function with exponential backoff for transient failures"""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except subprocess.CalledProcessError as e:
+            # Only retry on specific exit codes that indicate transient failures
+            # Exit codes like network errors, temporary service unavailability
+            if attempt < max_retries - 1 and e.returncode in [1, 2, 124, 137]:
+                delay = initial_delay * (2 ** attempt)
+                logger.warning(f"Attempt {attempt + 1} failed with exit code {e.returncode}, retrying in {delay}s...")
+                time.sleep(delay)
+            else:
+                raise
+        except Exception as e:
+            # For other exceptions, only retry on specific transient errors
+            error_str = str(e).lower()
+            is_transient = any(keyword in error_str for keyword in [
+                'timeout', 'connection', 'network', 'throttl', 'rate limit', 'service unavailable'
+            ])
+            if attempt < max_retries - 1 and is_transient:
+                delay = initial_delay * (2 ** attempt)
+                logger.warning(f"Attempt {attempt + 1} failed with transient error, retrying in {delay}s: {e}")
+                time.sleep(delay)
+            else:
+                raise
+    # This should never be reached, but just in case
+    raise ScanException("Max retries exceeded")
 
 
 def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: str) -> Dict[str, Any]:
@@ -440,6 +521,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         logger.info(f"Processing Lambda function: {function_arn}")
 
+        # Prevent infinite loop - skip scanning the scanner function itself
+        scanner_function_name = os.environ.get('AWS_LAMBDA_FUNCTION_NAME')
+        target_function_name = function_arn.split(':')[-1]  # Extract function name from ARN
+
+        if scanner_function_name and target_function_name == scanner_function_name:
+            logger.info(f"Skipping scan - avoiding self-scan of scanner function: {scanner_function_name}")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message': 'Scan skipped - self-scan prevention',
+                    'function_arn': function_arn
+                })
+            }
+
         qualys_creds = get_qualys_credentials()
         cross_account_role = os.environ.get('CROSS_ACCOUNT_ROLE_ARN')
         lambda_details = get_lambda_details(function_arn, cross_account_role)
@@ -447,6 +542,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         code_sha256 = lambda_details.get('code_sha256')
         if code_sha256 and check_scan_cache(function_arn, code_sha256):
             logger.info(f"Skipping scan - already scanned recently")
+            # Publish cache hit metric
+            publish_custom_metrics({'cache_hit': True})
             return {
                 'statusCode': 200,
                 'body': json.dumps({
@@ -461,10 +558,30 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         logger.info(f"Scanning Lambda: {function_arn}")
         logger.info(f"Package type: {lambda_details['package_type']}, Code SHA256: {code_sha256}")
 
+        # Track scan duration
+        scan_start_time = time.time()
         scan_results = run_qscanner(function_arn, qualys_creds, aws_region)
+        scan_duration = time.time() - scan_start_time
 
         update_scan_cache(function_arn, lambda_details, scan_results)
         store_results(lambda_details, scan_results)
+
+        # Extract vulnerability count if available
+        vuln_count = 0
+        if 'results' in scan_results and isinstance(scan_results['results'], dict):
+            vuln_summary = scan_results['results'].get('vulnerabilities', {})
+            if isinstance(vuln_summary, dict):
+                vuln_count = sum(vuln_summary.values()) if vuln_summary else 0
+            elif isinstance(vuln_summary, list):
+                vuln_count = len(vuln_summary)
+
+        # Publish scan metrics
+        publish_custom_metrics({
+            'cache_hit': False,
+            'scan_success': scan_results['success'],
+            'scan_duration': scan_duration,
+            'vulnerability_count': vuln_count
+        })
 
         return {
             'statusCode': 200,
@@ -482,7 +599,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             'statusCode': 500,
             'body': json.dumps({
                 'message': 'Scan failed',
-                'request_id': context.request_id
+                'request_id': context.aws_request_id
             })
         }
 

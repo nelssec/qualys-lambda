@@ -158,6 +158,17 @@ Resources:
         - Key: ManagedBy
           Value: CloudFormation
 
+  ScannerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-scanner-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scanner-dlq'
+        - Key: ManagedBy
+          Value: CloudFormation
+
   ScannerLambdaRole:
     Type: AWS::IAM::Role
     Properties:
@@ -201,6 +212,16 @@ Resources:
                 Action:
                   - secretsmanager:GetSecretValue
                 Resource: !Ref QualysSecretArn
+              - Sid: SQSDeadLetterQueue
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt ScannerDeadLetterQueue.Arn
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
               - !If
                 - CreateScanCache
                 - Sid: DynamoDBAccess
@@ -266,6 +287,8 @@ Resources:
         Size: !Ref ScannerEphemeralStorage
       Layers:
         - !Ref QScannerLayerArn
+      DeadLetterConfig:
+        TargetArn: !GetAtt ScannerDeadLetterQueue.Arn
       Environment:
         Variables:
           QUALYS_SECRET_ARN: !Ref QualysSecretArn
@@ -467,6 +490,89 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !GetAtt CloudTrailLogGroup.Arn
+
+  # CloudWatch Alarms for monitoring scanner health
+  ScannerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSTopic
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-scanner-errors'
+      AlarmDescription: 'Scanner Lambda has errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ScannerLambdaFunction
+      AlarmActions:
+        - !Ref ScanNotificationsTopic
+
+  ScannerThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSTopic
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-scanner-throttles'
+      AlarmDescription: 'Scanner Lambda is being throttled'
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ScannerLambdaFunction
+      AlarmActions:
+        - !Ref ScanNotificationsTopic
+
+  ScannerDLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSTopic
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-scanner-dlq-messages'
+      AlarmDescription: 'Messages in scanner DLQ - indicates failed scans'
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ScannerDeadLetterQueue.QueueName
+      AlarmActions:
+        - !Ref ScanNotificationsTopic
+
+  ScannerDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSTopic
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-scanner-duration'
+      AlarmDescription: 'Scanner Lambda approaching timeout threshold'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Sub
+        - '${TimeoutMillis}'
+        - TimeoutMillis: !Join ['', [!Ref ScannerTimeout, '000']]  # Convert to milliseconds, then 80%
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ScannerLambdaFunction
+      AlarmActions:
+        - !Ref ScanNotificationsTopic
 
 Outputs:
   ScannerLambdaArn:
