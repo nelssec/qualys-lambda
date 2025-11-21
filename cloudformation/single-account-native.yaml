@@ -433,10 +433,18 @@ Resources:
       EnableLogFileValidation: true
       CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
       CloudWatchLogsRoleArn: !GetAtt CloudTrailLogsRole.Arn
-      EventSelectors:
-        - ReadWriteType: WriteOnly
-          IncludeManagementEvents: true
-          DataResources: []
+      # Use AdvancedEventSelectors to only log Lambda management events
+      # This reduces CloudTrail costs by avoiding ALL management events from all services
+      # Note: CloudTrail doesn't support filtering to specific API calls, only by service
+      AdvancedEventSelectors:
+        - Name: 'LambdaManagementEvents'
+          FieldSelectors:
+            - Field: 'eventCategory'
+              Equals:
+                - 'Management'
+            - Field: 'resources.type'
+              Equals:
+                - 'AWS::Lambda::Function'
 
   CloudTrailLogsRole:
     Type: AWS::IAM::Role
