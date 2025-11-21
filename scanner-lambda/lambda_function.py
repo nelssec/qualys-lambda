@@ -274,8 +274,8 @@ def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: st
         raise ScanException(f"Scan timeout after {SCAN_TIMEOUT} seconds")
 
 
-def extract_repo_tags(scan_results: Dict[str, Any]) -> Optional[str]:
-    """Extract and validate RepoTags from scan results JSON"""
+def extract_repo_tags(scan_results: Dict[str, Any], scan_timestamp: str) -> str:
+    """Extract and validate RepoTags from scan results JSON, or generate one"""
     try:
         repo_tag = None
 
@@ -298,21 +298,27 @@ def extract_repo_tags(scan_results: Dict[str, Any]) -> Optional[str]:
                 pass
 
         if not repo_tag:
-            logger.warning("No RepoTags found in scan results")
-            return None
+            # Generate RepoTag from scan timestamp for Zip-based Lambdas
+            scan_epoch = int(datetime.fromisoformat(scan_timestamp).timestamp())
+            repo_tag = f"lambdascan:{scan_epoch}"
+            logger.info(f"Generated RepoTag: {repo_tag}")
 
         if not validate_tag_value(repo_tag):
             logger.warning(f"Invalid RepoTag format or length, skipping tag (length: {len(repo_tag)})")
-            return None
+            # Fallback to timestamp-based tag
+            scan_epoch = int(datetime.fromisoformat(scan_timestamp).timestamp())
+            repo_tag = f"lambdascan:{scan_epoch}"
 
         return repo_tag
 
     except Exception as e:
         logger.error(f"Error extracting RepoTags: {e}")
-        return None
+        # Fallback to timestamp-based tag
+        scan_epoch = int(datetime.fromisoformat(scan_timestamp).timestamp())
+        return f"lambdascan:{scan_epoch}"
 
 
-def tag_lambda_function(function_arn: str, repo_tag: Optional[str], scan_timestamp: str, scan_success: bool) -> None:
+def tag_lambda_function(function_arn: str, repo_tag: str, scan_timestamp: str, scan_success: bool) -> None:
     """Tag Lambda function with scan results"""
     try:
         tags = {
@@ -320,12 +326,11 @@ def tag_lambda_function(function_arn: str, repo_tag: Optional[str], scan_timesta
             'QualysScanStatus': 'success' if scan_success else 'failed'
         }
 
-        if repo_tag:
-            # Strip "lambdascan:" prefix if present
-            scan_tag = repo_tag.split(':', 1)[1] if ':' in repo_tag else repo_tag
-            tags['QualysScanTag'] = scan_tag
-            safe_scan_tag = scan_tag[:100] if len(scan_tag) > 100 else scan_tag
-            logger.info(f"Tagging Lambda with ScanTag: {safe_scan_tag}")
+        # Extract just the timestamp portion (strip "lambdascan:" prefix if present)
+        scan_tag = repo_tag.split(':', 1)[1] if ':' in repo_tag else repo_tag
+        safe_scan_tag = scan_tag[:100] if len(scan_tag) > 100 else scan_tag
+        tags['QualysScanTag'] = safe_scan_tag
+        logger.info(f"Tagging Lambda with ScanTag: {safe_scan_tag}")
 
         lambda_client.tag_resource(
             Resource=function_arn,
@@ -383,7 +388,7 @@ def store_results(lambda_details: Dict[str, Any], scan_results: Dict[str, Any]) 
         except Exception as e:
             logger.error(f"Failed to send SNS notification: {e}")
 
-    repo_tag = extract_repo_tags(scan_results)
+    repo_tag = extract_repo_tags(scan_results, timestamp)
     tag_lambda_function(lambda_details['function_arn'], repo_tag, timestamp, scan_results['success'])
 
 
