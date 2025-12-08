@@ -8,4 +8,20 @@ __pycache__/
 *.tfstate.backup
 .terraform.lock.hcl
 terraform.tfvars
+
+# Scanner binary (extracted from .gz)
 scanner-lambda/qscanner
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test outputs
+*.log
+scan-result*.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
