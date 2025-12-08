@@ -12,6 +12,7 @@ Automated security scanning for AWS Lambda functions using Qualys QScanner. This
 - [Multi-Account StackSet Deployment](#multi-account-stackset-deployment)
 - [Centralized Hub-Spoke Deployment](#centralized-hub-spoke-deployment)
 - [Bulk Scanning Existing Functions](#bulk-scanning-existing-functions)
+- [Qualys Image Tagging](#qualys-image-tagging)
 - [Configuration Reference](#configuration-reference)
 - [Security Features](#security-features)
 - [Monitoring and Alerting](#monitoring-and-alerting)
@@ -360,6 +361,20 @@ aws lambda invoke \
   output.json
 ```
 
+### Multi-Region Bulk Scan
+
+Scan across multiple regions:
+
+```bash
+aws lambda invoke \
+  --function-name qualys-lambda-bulk-scan \
+  --payload '{"regions": ["us-east-1", "us-west-2", "eu-west-1"]}' \
+  --region us-east-1 \
+  output.json
+```
+
+Or set default regions via environment variable `DEFAULT_REGIONS` (comma-separated).
+
 ### Scheduled Bulk Scans
 
 Enable scheduled bulk scans during deployment:
@@ -389,6 +404,7 @@ Schedule expression examples:
   "body": {
     "accounts_processed": 3,
     "accounts_failed": 0,
+    "regions_scanned": 3,
     "total_functions": 5247,
     "invoked": 5247,
     "failed": 0,
@@ -396,14 +412,55 @@ Schedule expression examples:
       {
         "account": "111111111111",
         "status": "success",
-        "functions": 2341,
-        "invoked": 2341,
-        "failed": 0
+        "total_functions": 2341,
+        "total_invoked": 2341,
+        "total_failed": 0,
+        "regions": [
+          {"region": "us-east-1", "status": "success", "functions": 1200, "invoked": 1200, "failed": 0},
+          {"region": "us-west-2", "status": "success", "functions": 800, "invoked": 800, "failed": 0},
+          {"region": "eu-west-1", "status": "success", "functions": 341, "invoked": 341, "failed": 0}
+        ]
       }
     ]
   }
 }
 ```
+
+## Qualys Image Tagging
+
+Automatically tag scanned images in Qualys Container Security to link them back to their source Lambda functions.
+
+### Tag Hierarchy
+
+```
+Lambda
+├── us-east-1
+│   ├── arn:aws:lambda:us-east-1:123456789012:function:my-function
+│   └── arn:aws:lambda:us-east-1:123456789012:function:other-function
+├── us-west-2
+│   └── arn:aws:lambda:us-west-2:234567890123:function:another-function
+└── eu-west-1
+    └── ...
+```
+
+### Enable Tagging
+
+1. Set `EnableQualysTagging: 'true'` in CloudFormation parameters
+2. Provide Qualys API credentials:
+   - `QualysApiUsername`: Qualys API username
+   - `QualysApiPassword`: Qualys API password
+
+These credentials are stored in Secrets Manager alongside the access token.
+
+### How It Works
+
+After a successful scan:
+1. Scanner extracts the image SHA256 from scan results
+2. Looks up the image in Qualys CS API by SHA
+3. Creates tag hierarchy if needed (Lambda → region → ARN)
+4. Assigns the ARN tag to the scanned image
+
+This enables filtering and searching images in Qualys by Lambda function ARN.
 
 ## Configuration Reference
 
@@ -424,6 +481,10 @@ Schedule expression examples:
 | ScannerReservedConcurrency | Number | 10 | Max concurrent scanner executions |
 | EnableBulkScan | String | true | Deploy bulk scan Lambda |
 | BulkScanSchedule | String | (empty) | Cron expression for scheduled scans |
+| BulkScanDefaultRegions | String | (empty) | Comma-separated regions for bulk scan |
+| EnableQualysTagging | String | false | Tag images in Qualys CS with Lambda ARN |
+| QualysApiUsername | String | (empty) | Qualys API username (for tagging) |
+| QualysApiPassword | String | (empty) | Qualys API password (for tagging) |
 
 #### Single Account Parameters
 
@@ -461,15 +522,22 @@ Scanner Lambda environment variables:
 | CACHE_TTL_DAYS | Cache TTL in days |
 | QSCANNER_PATH | Path to QScanner binary |
 | CROSS_ACCOUNT_ROLE_NAME | Role name for cross-account access |
+| SCANNER_EXTERNAL_ID | External ID for cross-account role assumption |
+| ENABLE_QUALYS_TAGGING | Enable Qualys CS image tagging (true/false) |
+| DEFAULT_REGIONS | Comma-separated regions for bulk scan |
 
 ### Secrets Manager Format
 
 ```json
 {
   "qualys_pod": "US2",
-  "qualys_access_token": "your-access-token"
+  "qualys_access_token": "your-access-token",
+  "qualys_api_username": "your-api-username",
+  "qualys_api_password": "your-api-password"
 }
 ```
+
+The `qualys_api_username` and `qualys_api_password` fields are only required if `EnableQualysTagging` is enabled.
 
 ## Security Features
 
@@ -480,7 +548,7 @@ Scanner Lambda environment variables:
 - SQS queue encryption with KMS
 - SNS topic encryption with KMS
 - CloudWatch Logs encryption with KMS
-- S3 bucket encryption with AES-256
+- S3 bucket encryption with KMS
 
 ### IAM Least Privilege
 
@@ -498,7 +566,7 @@ Scanner Lambda environment variables:
 ### Audit and Compliance
 
 - X-Ray tracing enabled for request tracking
-- CloudWatch Logs with 30-day retention
+- CloudWatch Logs with 90-day retention
 - S3 versioning enabled for result artifacts
 - DynamoDB point-in-time recovery enabled
 - Lambda functions tagged with scan metadata
@@ -519,6 +587,9 @@ The following alarms are created when SNS notifications are enabled:
 | Scanner Throttles | > 1 in 5 min | Scanner being throttled |
 | DLQ Messages | > 0 | Failed scans in dead letter queue |
 | Scanner Duration | > 80% timeout | Scans approaching timeout |
+| DynamoDB Throttling | > 0 | DynamoDB read/write throttling |
+| Scanner Concurrency | > 80% reserved | Approaching concurrency limit |
+| Scan Success Rate | < 90% | Low scan success rate |
 
 ### CloudWatch Metrics
 
