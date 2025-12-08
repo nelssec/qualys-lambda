@@ -210,6 +210,14 @@ def qualys_cs_api_request(
 
     except urllib.error.HTTPError as e:
         logger.error(f"Qualys CS API HTTP error: {e.code} - {e.reason}")
+        try:
+            error_body = e.read().decode('utf-8')
+            logger.error(f"CS API error body: {error_body[:500]}")
+            # Return the error body for caller to inspect
+            if error_body:
+                return e.code, json.loads(error_body) if error_body.strip().startswith('{') else {'error': error_body}
+        except Exception:
+            pass
         return e.code, None
     except urllib.error.URLError as e:
         logger.error(f"Qualys CS API URL error: {e.reason}")
@@ -551,13 +559,22 @@ def assign_tag_to_image(
         "entityType": "IMAGE"
     }
 
+    logger.info(f"Assigning tag: image_uuid={image_uuid}, tag_uuid={tag_uuid}")
     status, response = qualys_cs_api_request(gateway_url, endpoint, token, 'POST', assign_data)
 
     if status in (200, 201, 204):
         logger.info(f"Successfully assigned tag {tag_uuid} to image {image_uuid}")
         return True
+    elif status == 400:
+        # Check if tag is already assigned - treat as success
+        error_msg = str(response) if response else ''
+        if 'already' in error_msg.lower() or 'exist' in error_msg.lower():
+            logger.info(f"Tag {tag_uuid} already assigned to image {image_uuid}")
+            return True
+        logger.error(f"Failed to assign tag to image: status={status}, response={response}")
+        return False
     else:
-        logger.error(f"Failed to assign tag to image: status={status}")
+        logger.error(f"Failed to assign tag to image: status={status}, response={response}")
         return False
 
 
@@ -614,12 +631,14 @@ def tag_qualys_image(qualys_creds: Dict[str, str], function_arn: str, image_sha:
         if not image_uuid:
             logger.error("Image response missing 'uuid' field")
             return False
+        logger.info(f"Found image in Qualys: uuid={image_uuid}")
 
         # Ensure tag hierarchy exists using Asset Management API
         arn_tag_uuid = ensure_tag_hierarchy(api_url, username, password, function_arn)
         if not arn_tag_uuid:
             logger.error("Failed to create tag hierarchy")
             return False
+        logger.info(f"Tag hierarchy ready: arn_tag_uuid={arn_tag_uuid}")
 
         # Assign tag to image using CS API
         return assign_tag_to_image(gateway_url, token, image_uuid, arn_tag_uuid)

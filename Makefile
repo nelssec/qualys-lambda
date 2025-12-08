@@ -57,8 +57,9 @@ help:
 	@echo ""
 	@echo "Examples:"
 	@echo "  make deploy QUALYS_POD=US2 AWS_REGION=us-east-1"
+	@echo "  make deploy TAG=true USERNAME=myuser PASSWORD=mypass"
 	@echo "  make deploy-hub TAG=true USERNAME=myuser PASSWORD=mypass"
-	@echo "  make deploy-stackset ORG_UNIT_IDS=ou-xxxx-xxxxxxxx"
+	@echo "  make deploy-stackset ORG_UNIT_IDS=ou-xxxx TAG=true USERNAME=myuser PASSWORD=mypass"
 
 # =============================================================================
 # Build Targets
@@ -121,10 +122,15 @@ create-secret:
 		exit 1; \
 	fi
 	@mkdir -p build
-	@SECRET_ARN=$$(aws secretsmanager create-secret \
+	@if [ -n "$(USERNAME)" ] && [ -n "$(PASSWORD)" ]; then \
+		SECRET_JSON='{"qualys_pod":"$(QUALYS_POD)","qualys_access_token":"$(QUALYS_ACCESS_TOKEN)","qualys_api_username":"$(USERNAME)","qualys_api_password":"$(PASSWORD)"}'; \
+	else \
+		SECRET_JSON='{"qualys_pod":"$(QUALYS_POD)","qualys_access_token":"$(QUALYS_ACCESS_TOKEN)"}'; \
+	fi; \
+	SECRET_ARN=$$(aws secretsmanager create-secret \
 		--name "$(STACK_NAME)-qualys-credentials" \
 		--description "Qualys credentials for Lambda scanner" \
-		--secret-string '{"qualys_pod":"$(QUALYS_POD)","qualys_access_token":"$(QUALYS_ACCESS_TOKEN)"}' \
+		--secret-string "$$SECRET_JSON" \
 		--region $(AWS_REGION) \
 		--query ARN \
 		--output text 2>/dev/null || \
@@ -143,6 +149,11 @@ create-secret:
 # Deploy to single account/region
 deploy: publish-layer upload-function create-secret
 	@echo "Deploying CloudFormation stack..."
+	@if [ "$(TAG)" = "true" ] && { [ -z "$(USERNAME)" ] || [ -z "$(PASSWORD)" ]; }; then \
+		echo "ERROR: TAG=true requires USERNAME and PASSWORD"; \
+		echo "Usage: make deploy TAG=true USERNAME=myuser PASSWORD=mypass"; \
+		exit 1; \
+	fi
 	@aws cloudformation deploy \
 		--template-file cloudformation/single-account-native.yaml \
 		--stack-name $(STACK_NAME) \
@@ -150,6 +161,7 @@ deploy: publish-layer upload-function create-secret
 			QualysPod=$(QUALYS_POD) \
 			QualysSecretArn=$$(cat build/secret-arn.txt) \
 			QScannerLayerArn=$$(cat build/layer-arn.txt) \
+			EnableQualysTagging=$(TAG) \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--region $(AWS_REGION)
 	@echo "Deployment complete!"
@@ -238,6 +250,11 @@ deploy-stackset: upload-artifacts
 		echo "Usage: make deploy-stackset ORG_UNIT_IDS=ou-xxxx-xxxxxxxx"; \
 		exit 1; \
 	fi
+	@if [ "$(TAG)" = "true" ] && { [ -z "$(USERNAME)" ] || [ -z "$(PASSWORD)" ]; }; then \
+		echo "ERROR: TAG=true requires USERNAME and PASSWORD"; \
+		echo "Usage: make deploy-stackset ORG_UNIT_IDS=ou-xxxx TAG=true USERNAME=myuser PASSWORD=mypass"; \
+		exit 1; \
+	fi
 	@BUCKET=$$(cat build/artifacts-bucket.txt); \
 	aws cloudformation create-stack-set \
 		--stack-set-name $(STACK_NAME)-stackset \
@@ -246,6 +263,9 @@ deploy-stackset: upload-artifacts
 			ParameterKey=QualysPod,ParameterValue=$(QUALYS_POD) \
 			ParameterKey=QualysAccessToken,ParameterValue=$(QUALYS_ACCESS_TOKEN) \
 			ParameterKey=ArtifactsBucket,ParameterValue=$$BUCKET \
+			ParameterKey=EnableQualysTagging,ParameterValue=$(TAG) \
+			ParameterKey=QualysApiUsername,ParameterValue=$(USERNAME) \
+			ParameterKey=QualysApiPassword,ParameterValue=$(PASSWORD) \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--permission-model SERVICE_MANAGED \
 		--auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
@@ -257,6 +277,9 @@ deploy-stackset: upload-artifacts
 				ParameterKey=QualysPod,ParameterValue=$(QUALYS_POD) \
 				ParameterKey=QualysAccessToken,ParameterValue=$(QUALYS_ACCESS_TOKEN) \
 				ParameterKey=ArtifactsBucket,ParameterValue=$$BUCKET \
+				ParameterKey=EnableQualysTagging,ParameterValue=$(TAG) \
+				ParameterKey=QualysApiUsername,ParameterValue=$(USERNAME) \
+				ParameterKey=QualysApiPassword,ParameterValue=$(PASSWORD) \
 			--capabilities CAPABILITY_NAMED_IAM \
 			--region $(AWS_REGION)
 	@echo "Creating stack instances in OUs: $(ORG_UNIT_IDS)..."
