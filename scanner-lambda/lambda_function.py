@@ -18,6 +18,10 @@ from botocore.exceptions import ClientError, BotoCoreError
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# Suppress noisy boto/botocore logs (e.g., "Found credentials in environment variables")
+logging.getLogger('botocore').setLevel(logging.WARNING)
+logging.getLogger('boto3').setLevel(logging.WARNING)
+
 lambda_client = boto3.client('lambda')
 secrets_manager = boto3.client('secretsmanager')
 s3_client = boto3.client('s3')
