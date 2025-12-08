@@ -140,6 +140,9 @@ export QUALYS_ACCESS_TOKEN="your-qualys-access-token"
 
 # Deploy to single account
 make deploy QUALYS_POD=US2 AWS_REGION=us-east-1
+
+# Deploy with Qualys image tagging enabled
+make deploy QUALYS_POD=US2 AWS_REGION=us-east-1 TAG=true USERNAME=your-username PASSWORD=your-password
 ```
 
 ### Deployment Steps
@@ -203,6 +206,16 @@ Deploy the scanner to multiple accounts via CloudFormation StackSets. Each accou
 
    For multiple OUs, provide a comma-separated list.
 
+   With Qualys image tagging enabled:
+   ```bash
+   make deploy-stackset \
+     QUALYS_POD=US2 \
+     ORG_UNIT_IDS=ou-xxxx-xxxxxxxx \
+     TAG=true \
+     USERNAME=your-username \
+     PASSWORD=your-password
+   ```
+
 3. Monitor deployment progress:
    ```bash
    aws cloudformation list-stack-instances \
@@ -253,6 +266,16 @@ make deploy-hub \
   QUALYS_POD=US2 \
   ORG_ID=o-xxxxxxxxxx \
   STACK_NAME=qscanner
+```
+
+With Qualys image tagging enabled:
+```bash
+make deploy-hub \
+  QUALYS_POD=US2 \
+  ORG_ID=o-xxxxxxxxxx \
+  TAG=true \
+  USERNAME=your-username \
+  PASSWORD=your-password
 ```
 
 Note the outputs, particularly the Central EventBridge Bus ARN.
@@ -443,14 +466,38 @@ Lambda
     └── ...
 ```
 
-### Enable Tagging
+### Enable Tagging at Deployment
 
-1. Set `EnableQualysTagging: 'true'` in CloudFormation parameters
-2. Provide Qualys API credentials:
-   - `QualysApiUsername`: Qualys API username
-   - `QualysApiPassword`: Qualys API password
+Add `TAG=true USERNAME=xxx PASSWORD=xxx` to any make deploy command:
 
-These credentials are stored in Secrets Manager alongside the access token.
+```bash
+# Single account
+make deploy QUALYS_POD=US2 AWS_REGION=us-east-1 TAG=true USERNAME=your-user PASSWORD=your-pass
+
+# StackSet
+make deploy-stackset QUALYS_POD=US2 ORG_UNIT_IDS=ou-xxxx TAG=true USERNAME=your-user PASSWORD=your-pass
+
+# Hub
+make deploy-hub QUALYS_POD=US2 ORG_ID=o-xxxx TAG=true USERNAME=your-user PASSWORD=your-pass
+```
+
+### Enable Tagging on Existing Deployment
+
+To enable tagging on an already-deployed stack, update the secret and Lambda environment variable:
+
+```bash
+# 1. Update the secret with API credentials
+aws secretsmanager update-secret \
+  --secret-id qualys-lambda-scanner-hub-qualys-credentials \
+  --secret-string '{"qualys_pod":"US2","qualys_access_token":"your-token","qualys_api_username":"your-user","qualys_api_password":"your-pass"}'
+
+# 2. Enable tagging on the Lambda function
+aws lambda update-function-configuration \
+  --function-name qualys-lambda-scanner-hub-scanner \
+  --environment "Variables={ENABLE_QUALYS_TAGGING=true,QUALYS_SECRET_ARN=arn:aws:secretsmanager:us-east-1:ACCOUNT:secret:qualys-lambda-scanner-hub-qualys-credentials-XXXX,...}"
+```
+
+Alternatively, update the CloudFormation stack with `EnableQualysTagging=true` and the API credentials.
 
 ### How It Works
 
