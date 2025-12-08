@@ -279,13 +279,22 @@ def qualys_api_request(
                 logger.warning(f"Qualys API {e.code}, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
                 time.sleep(delay)
                 continue
-            logger.error(f"Qualys API HTTP error: {e.code} - {e.reason}")
+
+            # Try to parse error body - especially useful for 409 conflicts
+            error_response = None
             try:
                 error_body = e.read().decode('utf-8')
-                logger.error(f"Error body: {error_body[:500]}")
-            except Exception:
-                pass
-            return e.code, None
+                if e.code != 409:  # Don't log 409 as error, it's expected
+                    logger.error(f"Qualys API HTTP error: {e.code} - {e.reason}")
+                    logger.error(f"Error body: {error_body[:500]}")
+                else:
+                    logger.info(f"Qualys API 409 conflict response: {error_body[:500]}")
+                if error_body and error_body.strip().startswith('{'):
+                    error_response = json.loads(error_body)
+            except Exception as parse_err:
+                logger.warning(f"Failed to parse error body: {parse_err}")
+
+            return e.code, error_response
 
         except urllib.error.URLError as e:
             last_error = e
@@ -453,6 +462,7 @@ def create_tag(
     if parent_tag_id:
         tag_data["ServiceRequest"]["data"]["Tag"]["parentTagId"] = parent_tag_id
 
+    logger.info(f"Creating tag: name='{tag_name}', parent_id={parent_tag_id}")
     status, response = qualys_api_request(gateway_url, endpoint, username, password, 'POST', tag_data)
 
     if status in (200, 201) and response:
@@ -476,10 +486,45 @@ def create_tag(
     elif status == 403:
         logger.error("Qualys API access denied - check 'Create User Tag' permission")
     elif status == 409:
-        logger.warning(f"Tag '{tag_name}' may already exist, searching...")
-        return search_tag_by_name(gateway_url, username, password, tag_name, parent_tag_id)
+        # Tag already exists - this is not an error
+        logger.info(f"Tag '{tag_name}' already exists (409 conflict)")
+
+        # Try to extract existing tag ID from 409 response body
+        if response:
+            try:
+                # Check various possible response structures for the existing tag
+                existing_tag = None
+                if 'ServiceResponse' in response:
+                    data = response.get('ServiceResponse', {}).get('data', [])
+                    if data and isinstance(data, list) and len(data) > 0:
+                        existing_tag = data[0].get('Tag', {})
+                elif 'Tag' in response:
+                    existing_tag = response.get('Tag', {})
+
+                if existing_tag:
+                    tag_uuid = existing_tag.get('uuid') or existing_tag.get('tagUuid') or existing_tag.get('id')
+                    if tag_uuid:
+                        cache_key = f"tag:{parent_tag_id or 'root'}:{tag_name}"
+                        _qualys_tag_cache[cache_key] = str(tag_uuid)
+                        logger.info(f"Extracted existing tag ID from 409 response: {tag_name} -> {tag_uuid}")
+                        return str(tag_uuid)
+            except Exception as e:
+                logger.warning(f"Failed to extract tag ID from 409 response: {e}")
+
+        # Fall back to searching for the tag with retries
+        logger.info(f"Searching for existing tag: {tag_name}")
+        for attempt in range(3):
+            tag_uuid = search_tag_by_name(gateway_url, username, password, tag_name, parent_tag_id)
+            if tag_uuid:
+                logger.info(f"Found existing tag via search: {tag_name} -> {tag_uuid}")
+                return tag_uuid
+            if attempt < 2:
+                time.sleep(1)  # Brief delay before retry
+
+        logger.warning(f"Tag '{tag_name}' reported as existing but could not find it")
+        return None
     else:
-        logger.error(f"Failed to create tag '{tag_name}': status={status}")
+        logger.error(f"Failed to create tag '{tag_name}': status={status}, response={response}")
 
     return None
 
@@ -496,12 +541,16 @@ def get_or_create_tag(
     Returns:
         Tag UUID or None on failure
     """
+    logger.info(f"get_or_create_tag: name='{tag_name}', parent_id={parent_tag_id}")
+
     # Try to find existing tag with parent context
     tag_uuid = search_tag_by_name(gateway_url, username, password, tag_name, parent_tag_id)
     if tag_uuid:
+        logger.info(f"Found existing tag: {tag_name} -> {tag_uuid}")
         return tag_uuid
 
     # Create new tag
+    logger.info(f"Tag not found, creating: {tag_name}")
     return create_tag(gateway_url, username, password, tag_name, parent_tag_id)
 
 
@@ -529,28 +578,39 @@ def ensure_tag_hierarchy(
         return None
 
     region = arn_parts[3]
+    account_id = arn_parts[4]
+    function_name = arn_parts[6]
+
+    logger.info(f"Ensuring tag hierarchy for: region={region}, account={account_id}, function={function_name}")
 
     # Use full ARN as tag name (Qualys supports up to 1024 chars)
     arn_tag_name = function_arn
 
-    # Get or create parent "Lambda" tag
+    # Step 1: Get or create parent "Lambda" tag (root level)
+    logger.info("Step 1: Getting/creating root 'Lambda' tag...")
     lambda_tag_id = get_or_create_tag(gateway_url, username, password, "Lambda")
     if not lambda_tag_id:
         logger.error("Failed to get/create Lambda parent tag")
         return None
+    logger.info(f"Lambda tag ID: {lambda_tag_id}")
 
-    # Get or create region tag under Lambda
+    # Step 2: Get or create region tag under Lambda
+    logger.info(f"Step 2: Getting/creating region tag '{region}' under Lambda...")
     region_tag_id = get_or_create_tag(gateway_url, username, password, region, lambda_tag_id)
     if not region_tag_id:
         logger.error(f"Failed to get/create region tag: {region}")
         return None
+    logger.info(f"Region tag ID: {region_tag_id}")
 
-    # Get or create ARN tag under region
+    # Step 3: Get or create ARN tag under region
+    logger.info(f"Step 3: Getting/creating ARN tag under region...")
     arn_tag_id = get_or_create_tag(gateway_url, username, password, arn_tag_name, region_tag_id)
     if not arn_tag_id:
         logger.error(f"Failed to get/create ARN tag: {arn_tag_name}")
         return None
+    logger.info(f"ARN tag ID: {arn_tag_id}")
 
+    logger.info(f"Tag hierarchy complete: Lambda({lambda_tag_id}) -> {region}({region_tag_id}) -> ARN({arn_tag_id})")
     return arn_tag_id
 
 
@@ -671,6 +731,14 @@ def publish_custom_metrics(metric_data: Dict[str, Any]) -> None:
             metrics.append({
                 'MetricName': 'ScanSuccess',
                 'Value': 1 if metric_data['scan_success'] else 0,
+                'Unit': 'Count'
+            })
+
+        # Partial success metric (SBOM uploaded but vuln report failed)
+        if 'scan_partial' in metric_data:
+            metrics.append({
+                'MetricName': 'ScanPartialSuccess',
+                'Value': 1 if metric_data['scan_partial'] else 0,
                 'Unit': 'Count'
             })
 
@@ -963,6 +1031,10 @@ def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: st
 
     logger.info(f"Executing: {' '.join(cmd[:6])} [credentials hidden] lambda {function_arn}")
 
+    # Exit codes that indicate partial success (SBOM uploaded but vuln report failed)
+    # 40 = Vulnerability reporter failed (404 Not Found) - scan data was still uploaded
+    PARTIAL_SUCCESS_EXIT_CODES = {40}
+
     try:
         result = subprocess.run(
             cmd,
@@ -973,12 +1045,18 @@ def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: st
         )
 
         if result.returncode != 0:
-            logger.error(f"QScanner failed with exit code {result.returncode}")
-            logger.error(f"STDOUT: {sanitize_log_output(result.stdout)}")
-            logger.error(f"STDERR: {sanitize_log_output(result.stderr)}")
-            raise ScanException("QScanner execution failed")
-
-        logger.info("QScanner completed successfully")
+            if result.returncode in PARTIAL_SUCCESS_EXIT_CODES:
+                logger.warning(f"QScanner partial success with exit code {result.returncode}")
+                logger.warning(f"STDOUT: {sanitize_log_output(result.stdout)}")
+                logger.warning(f"STDERR: {sanitize_log_output(result.stderr)}")
+                # Continue to process results - SBOM was uploaded, only vuln report failed
+            else:
+                logger.error(f"QScanner failed with exit code {result.returncode}")
+                logger.error(f"STDOUT: {sanitize_log_output(result.stdout)}")
+                logger.error(f"STDERR: {sanitize_log_output(result.stderr)}")
+                raise ScanException("QScanner execution failed")
+        else:
+            logger.info("QScanner completed successfully")
 
         # Read QScanner output files from /tmp/qscanner-output/
         scan_results = {}
@@ -1003,8 +1081,10 @@ def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: st
             logger.warning(f"Failed to read QScanner output files: {e}")
             scan_results = {}
 
+        is_partial = result.returncode in PARTIAL_SUCCESS_EXIT_CODES
         return {
-            'success': True,
+            'success': True,  # True for both full and partial success (SBOM uploaded)
+            'partial': is_partial,  # True if vuln report failed but SBOM succeeded
             'exit_code': result.returncode,
             'results': scan_results,
             'stdout': result.stdout,
@@ -1106,12 +1186,19 @@ def extract_image_sha(scan_results: Dict[str, Any]) -> Optional[str]:
         return None
 
 
-def tag_lambda_function(function_arn: str, repo_tag: Optional[str], scan_timestamp: str, scan_success: bool) -> None:
+def tag_lambda_function(function_arn: str, repo_tag: Optional[str], scan_timestamp: str, scan_success: bool, scan_partial: bool = False) -> None:
     """Tag Lambda function with scan results"""
     try:
+        if scan_success and scan_partial:
+            status = 'partial'  # SBOM uploaded but vuln report failed
+        elif scan_success:
+            status = 'success'
+        else:
+            status = 'failed'
+
         tags = {
             'QualysScanTimestamp': scan_timestamp,
-            'QualysScanStatus': 'success' if scan_success else 'failed'
+            'QualysScanStatus': status
         }
 
         # Only add QualysScanTag if repo_tag was found
@@ -1201,7 +1288,13 @@ def store_results(lambda_details: Dict[str, Any], scan_results: Dict[str, Any]) 
             logger.error(f"Failed to send SNS notification: {e}")
 
     repo_tag = extract_repo_tags(scan_results, timestamp)
-    tag_lambda_function(lambda_details['function_arn'], repo_tag, timestamp, scan_results['success'])
+    tag_lambda_function(
+        lambda_details['function_arn'],
+        repo_tag,
+        timestamp,
+        scan_results['success'],
+        scan_results.get('partial', False)
+    )
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -1300,17 +1393,22 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         publish_custom_metrics({
             'cache_hit': False,
             'scan_success': scan_results['success'],
+            'scan_partial': scan_results.get('partial', False),
             'scan_duration': scan_duration,
             'vulnerability_count': vuln_count
         })
 
+        is_partial = scan_results.get('partial', False)
+        message = 'Scan completed with partial success (vuln report fetch failed)' if is_partial else 'Scan completed successfully'
+
         return {
             'statusCode': 200,
             'body': json.dumps({
-                'message': 'Scan completed successfully',
+                'message': message,
                 'function_arn': function_arn,
                 'package_type': lambda_details['package_type'],
-                'scan_success': scan_results['success']
+                'scan_success': scan_results['success'],
+                'scan_partial': is_partial
             })
         }
 

@@ -211,21 +211,12 @@ create-artifacts-bucket:
 	@ACCOUNT_ID=$$(aws sts get-caller-identity --query Account --output text); \
 	BUCKET_NAME=qualys-scanner-artifacts-$$ACCOUNT_ID; \
 	aws s3 mb s3://$$BUCKET_NAME --region $(AWS_REGION) 2>/dev/null || true; \
-	aws s3api put-bucket-policy --bucket $$BUCKET_NAME --policy '{ \
-		"Version": "2012-10-17", \
-		"Statement": [{ \
-			"Sid": "AllowOrgAccess", \
-			"Effect": "Allow", \
-			"Principal": "*", \
-			"Action": ["s3:GetObject", "s3:GetObjectVersion"], \
-			"Resource": "arn:aws:s3:::'$$BUCKET_NAME'/*", \
-			"Condition": { \
-				"StringEquals": { \
-					"aws:PrincipalOrgID": "$(ORG_ID)" \
-				} \
-			} \
-		}] \
-	}'; \
+	if [ -n "$(ORG_ID)" ] && [ "$(ORG_ID)" != "None" ]; then \
+		echo "Applying org-wide bucket policy for $(ORG_ID)..."; \
+		aws s3api put-bucket-policy --bucket $$BUCKET_NAME --policy '{"Version":"2012-10-17","Statement":[{"Sid":"AllowOrgAccess","Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::'$$BUCKET_NAME'/*","Condition":{"StringEquals":{"aws:PrincipalOrgID":"$(ORG_ID)"}}}]}'; \
+	else \
+		echo "No ORG_ID provided - skipping org-wide bucket policy (single account mode)"; \
+	fi; \
 	echo $$BUCKET_NAME > build/artifacts-bucket.txt
 	@echo "Artifacts bucket: $$(cat build/artifacts-bucket.txt)"
 
