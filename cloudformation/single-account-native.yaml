@@ -30,6 +30,21 @@ Parameters:
     Type: String
     Description: 'ARN of the Lambda Layer containing QScanner binary'
 
+  LambdaCodeBucket:
+    Type: String
+    Description: 'S3 bucket containing Lambda code artifacts (leave empty to use inline placeholder code)'
+    Default: ''
+
+  LambdaCodeKey:
+    Type: String
+    Description: 'S3 key for scanner Lambda code zip'
+    Default: 'qualys-lambda-scanner/lambda-code.zip'
+
+  BulkScanCodeKey:
+    Type: String
+    Description: 'S3 key for bulk scan Lambda code zip'
+    Default: 'qualys-lambda-scanner/bulk-scan.zip'
+
   EnableS3Results:
     Type: String
     Description: 'Create S3 bucket for storing scan results'
@@ -127,6 +142,7 @@ Conditions:
   CreateBulkScanSchedule: !And
     - !Condition CreateBulkScan
     - !Not [!Equals [!Ref BulkScanSchedule, '']]
+  UseS3Code: !Not [!Equals [!Ref LambdaCodeBucket, '']]
 
 Resources:
   # KMS key for encrypting sensitive data (DynamoDB, SQS, SNS, CloudWatch Logs)
@@ -433,10 +449,13 @@ Resources:
           CACHE_TTL_DAYS: !Ref CacheTTLDays
           QSCANNER_PATH: '/opt/bin/qscanner'
           ENABLE_QUALYS_TAGGING: !Ref EnableQualysTagging
-      Code:
-        ZipFile: |
-          def lambda_handler(event, context):
-              return {"statusCode": 501, "body": "Replace with lambda_function.py code"}
+      Code: !If
+        - UseS3Code
+        - S3Bucket: !Ref LambdaCodeBucket
+          S3Key: !Ref LambdaCodeKey
+        - ZipFile: |
+            def lambda_handler(event, context):
+                return {"statusCode": 501, "body": "Replace with lambda_function.py code"}
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-scanner'
@@ -801,10 +820,13 @@ Resources:
           SCANNER_FUNCTION_NAME: !Ref ScannerLambdaFunction
           EXCLUDE_PATTERNS: !Sub '${AWS::StackName}-scanner,${AWS::StackName}-bulk-scan'
           INVOCATION_DELAY_MS: '100'
-      Code:
-        ZipFile: |
-          def lambda_handler(event, context):
-              return {"statusCode": 501, "body": "Replace with bulk_scan.py code"}
+      Code: !If
+        - UseS3Code
+        - S3Bucket: !Ref LambdaCodeBucket
+          S3Key: !Ref BulkScanCodeKey
+        - ZipFile: |
+            def lambda_handler(event, context):
+                return {"statusCode": 501, "body": "Replace with bulk_scan.py code"}
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-bulk-scan'
