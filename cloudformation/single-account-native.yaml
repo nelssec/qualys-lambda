@@ -105,11 +105,28 @@ Parameters:
       - 'true'
       - 'false'
 
+  EnableBulkScan:
+    Type: String
+    Description: 'Enable bulk scan Lambda to scan existing functions'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  BulkScanSchedule:
+    Type: String
+    Description: 'Cron schedule for periodic bulk scans (empty = manual only). Example: cron(0 2 ? * SUN *) for weekly Sunday 2am'
+    Default: ''
+
 Conditions:
   CreateS3Bucket: !Equals [!Ref EnableS3Results, 'true']
   CreateSNSTopic: !Equals [!Ref EnableSNSNotifications, 'true']
   CreateScanCache: !Equals [!Ref EnableScanCache, 'true']
   CreateTrail: !Equals [!Ref CreateCloudTrail, 'true']
+  CreateBulkScan: !Equals [!Ref EnableBulkScan, 'true']
+  CreateBulkScanSchedule: !And
+    - !Condition CreateBulkScan
+    - !Not [!Equals [!Ref BulkScanSchedule, '']]
 
 Resources:
   # KMS key for encrypting sensitive data (DynamoDB, SQS, SNS, CloudWatch Logs)
@@ -418,10 +435,8 @@ Resources:
           ENABLE_QUALYS_TAGGING: !Ref EnableQualysTagging
       Code:
         ZipFile: |
-          # Placeholder - replace with actual code via S3 or inline
-          # See scanner-lambda/lambda_function.py for full implementation
           def lambda_handler(event, context):
-              return {"statusCode": 200, "body": "Placeholder"}
+              return {"statusCode": 501, "body": "Replace with lambda_function.py code"}
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-scanner'
@@ -723,6 +738,101 @@ Resources:
       AlarmActions:
         - !Ref ScanNotificationsTopic
 
+  # =============================================================================
+  # Bulk Scan Lambda (Optional) - Scans existing functions
+  # =============================================================================
+
+  BulkScanLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateBulkScan
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-bulk-scan-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BulkScanPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListLambdaFunctions
+                Effect: Allow
+                Action:
+                  - lambda:ListFunctions
+                Resource: '*'
+              - Sid: InvokeScanner
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ScannerLambdaFunction.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bulk-scan-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  BulkScanLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateBulkScan
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-bulk-scan'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt ScannerKMSKey.Arn
+
+  BulkScanLambdaFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateBulkScan
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-bulk-scan'
+      Description: 'Scans all existing Lambda functions by invoking the scanner'
+      Runtime: python3.11
+      Handler: bulk_scan.lambda_handler
+      Role: !GetAtt BulkScanLambdaRole.Arn
+      MemorySize: 256
+      Timeout: 900
+      Environment:
+        Variables:
+          SCANNER_FUNCTION_NAME: !Ref ScannerLambdaFunction
+          EXCLUDE_PATTERNS: !Sub '${AWS::StackName}-scanner,${AWS::StackName}-bulk-scan'
+          INVOCATION_DELAY_MS: '100'
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"statusCode": 501, "body": "Replace with bulk_scan.py code"}
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bulk-scan'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  BulkScanScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: CreateBulkScanSchedule
+    Properties:
+      Name: !Sub '${AWS::StackName}-bulk-scan-schedule'
+      Description: 'Scheduled bulk scan of existing Lambda functions'
+      State: ENABLED
+      ScheduleExpression: !Ref BulkScanSchedule
+      Targets:
+        - Arn: !GetAtt BulkScanLambdaFunction.Arn
+          Id: BulkScanTarget
+          Input: '{}'
+
+  BulkScanSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateBulkScanSchedule
+    Properties:
+      FunctionName: !Ref BulkScanLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BulkScanScheduleRule.Arn
+
 Outputs:
   ScannerLambdaArn:
     Description: 'ARN of the Scanner Lambda function'
@@ -763,3 +873,10 @@ Outputs:
     Value: !GetAtt ScannerKMSKey.Arn
     Export:
       Name: !Sub '${AWS::StackName}-KMSKeyArn'
+
+  BulkScanLambdaArn:
+    Description: 'ARN of the Bulk Scan Lambda function'
+    Condition: CreateBulkScan
+    Value: !GetAtt BulkScanLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BulkScanLambdaArn'
