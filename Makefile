@@ -8,6 +8,11 @@ LAYER_NAME ?= qscanner
 S3_BUCKET ?= $(STACK_NAME)-artifacts-$(shell aws sts get-caller-identity --query Account --output text)
 QUALYS_ACCESS_TOKEN ?= $(shell echo $$QUALYS_ACCESS_TOKEN)
 
+# Qualys tagging variables (optional)
+TAG ?= false
+USERNAME ?=
+PASSWORD ?=
+
 # StackSet/Organization variables
 ORG_ID ?= $(shell aws organizations describe-organization --query 'Organization.Id' --output text 2>/dev/null)
 ORG_UNIT_IDS ?=
@@ -41,13 +46,16 @@ help:
 	@echo "  AWS_REGION           - AWS region (default: us-east-1)"
 	@echo "  STACK_NAME           - CloudFormation stack name (default: qscanner)"
 	@echo "  QUALYS_POD           - Qualys POD (default: US2)"
-	@echo "  QUALYS_ACCESS_TOKEN  - Qualys access token (required)"
+	@echo "  QUALYS_ACCESS_TOKEN  - Qualys access token (required, or set env var)"
 	@echo "  ORG_UNIT_IDS         - Comma-separated OU IDs for StackSet deployment"
+	@echo "  TAG                  - Enable Qualys image tagging (true/false, default: false)"
+	@echo "  USERNAME             - Qualys API username (required if TAG=true)"
+	@echo "  PASSWORD             - Qualys API password (required if TAG=true)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make deploy QUALYS_POD=US2 AWS_REGION=us-east-1"
+	@echo "  make deploy-hub TAG=true USERNAME=myuser PASSWORD=mypass"
 	@echo "  make deploy-stackset ORG_UNIT_IDS=ou-xxxx-xxxxxxxx"
-	@echo "  make deploy-hub && make deploy-spoke-stackset ORG_UNIT_IDS=ou-xxxx-xxxxxxxx"
 
 # =============================================================================
 # Build Targets
@@ -290,6 +298,13 @@ deploy-hub: upload-artifacts
 		echo "ERROR: QUALYS_ACCESS_TOKEN environment variable not set"; \
 		exit 1; \
 	fi
+	@if [ "$(TAG)" = "true" ]; then \
+		if [ -z "$(USERNAME)" ] || [ -z "$(PASSWORD)" ]; then \
+			echo "ERROR: TAG=true requires USERNAME and PASSWORD"; \
+			echo "Usage: make deploy-hub TAG=true USERNAME=myuser PASSWORD=mypass"; \
+			exit 1; \
+		fi; \
+	fi
 	@BUCKET=$$(cat build/artifacts-bucket.txt); \
 	aws cloudformation deploy \
 		--template-file cloudformation/centralized-hub.yaml \
@@ -299,6 +314,9 @@ deploy-hub: upload-artifacts
 			QualysAccessToken=$(QUALYS_ACCESS_TOKEN) \
 			ArtifactsBucket=$$BUCKET \
 			OrganizationId=$(ORG_ID) \
+			EnableQualysTagging=$(TAG) \
+			QualysApiUsername=$(USERNAME) \
+			QualysApiPassword=$(PASSWORD) \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--region $(AWS_REGION)
 	@echo ""

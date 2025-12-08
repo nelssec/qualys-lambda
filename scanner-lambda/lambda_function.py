@@ -240,11 +240,7 @@ def qualys_api_request(
 
 
 def get_image_by_sha(gateway_url: str, username: str, password: str, image_sha: str) -> Optional[Dict]:
-    """Get image details from Qualys CS by SHA256.
-
-    Returns:
-        Image details dict including 'uuid' or None if not found
-    """
+    """Get image details from Qualys CS by SHA256."""
     # Remove 'sha256:' prefix if present
     if image_sha.startswith('sha256:'):
         image_sha = image_sha[7:]
@@ -254,10 +250,16 @@ def get_image_by_sha(gateway_url: str, username: str, password: str, image_sha: 
 
     if status == 200 and response:
         return response
+    elif status == 401:
+        logger.error("Qualys API authentication failed - check username/password")
+    elif status == 403:
+        logger.error("Qualys API access denied - check user permissions for Container Security")
     elif status == 404:
-        logger.warning(f"Image not found in Qualys: {image_sha}")
+        logger.warning(f"Image not found in Qualys (may not be scanned yet): {image_sha[:16]}...")
+    elif status == 0:
+        logger.error("Qualys API connection failed - check network/gateway URL")
     else:
-        logger.error(f"Failed to get image from Qualys: status={status}")
+        logger.error(f"Qualys API error: status={status}")
 
     return None
 
@@ -382,13 +384,21 @@ def create_tag(
         try:
             tag_uuid = response.get('ServiceResponse', {}).get('data', [{}])[0].get('Tag', {}).get('id')
             if tag_uuid:
-                # Cache with parent context for uniqueness
                 cache_key = f"tag:{parent_tag_id or 'root'}:{tag_name}"
                 _qualys_tag_cache[cache_key] = str(tag_uuid)
-                logger.info(f"Created Qualys tag: {tag_name} (parent={parent_tag_id}) -> {tag_uuid}")
+                logger.info(f"Created Qualys tag: {tag_name} -> {tag_uuid}")
                 return str(tag_uuid)
+            else:
+                logger.error(f"Tag created but no ID in response: {response}")
         except (KeyError, IndexError, TypeError) as e:
-            logger.error(f"Error parsing tag create response: {e}")
+            logger.error(f"Unexpected tag create response format: {e}")
+    elif status == 401:
+        logger.error("Qualys API authentication failed - check username/password")
+    elif status == 403:
+        logger.error("Qualys API access denied - check 'Create User Tag' permission")
+    elif status == 409:
+        logger.warning(f"Tag '{tag_name}' may already exist, searching...")
+        return search_tag_by_name(gateway_url, username, password, tag_name, parent_tag_id)
     else:
         logger.error(f"Failed to create tag '{tag_name}': status={status}")
 
@@ -509,20 +519,27 @@ def tag_qualys_image(qualys_creds: Dict[str, str], function_arn: str, image_sha:
     if not ENABLE_QUALYS_TAGGING:
         return True
 
-    # Check for required credentials
-    username = qualys_creds.get('qualys_api_username')
-    password = qualys_creds.get('qualys_api_password')
-    pod = qualys_creds.get('qualys_pod')
-
-    if not username or not password:
-        logger.warning("Qualys API credentials not configured, skipping image tagging")
-        return False
+    # Validate credentials
+    username = qualys_creds.get('qualys_api_username', '').strip()
+    password = qualys_creds.get('qualys_api_password', '').strip()
+    pod = qualys_creds.get('qualys_pod', '').strip()
 
     if not pod:
-        logger.error("Qualys pod not configured")
+        logger.error("Qualys tagging enabled but 'qualys_pod' missing from credentials")
+        return False
+
+    if not username:
+        logger.error("Qualys tagging enabled but 'qualys_api_username' missing from credentials. "
+                     "Add username to Secrets Manager or disable tagging.")
+        return False
+
+    if not password:
+        logger.error("Qualys tagging enabled but 'qualys_api_password' missing from credentials. "
+                     "Add password to Secrets Manager or disable tagging.")
         return False
 
     gateway_url = get_qualys_gateway_url(pod)
+    logger.info(f"Qualys tagging: using gateway {gateway_url} for pod {pod}")
 
     try:
         # Get image UUID from Qualys
