@@ -97,6 +97,14 @@ Parameters:
     MinValue: 1
     MaxValue: 100
 
+  EnableQualysTagging:
+    Type: String
+    Description: 'Enable Qualys Container Security tagging to link images to Lambda ARNs'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
 Conditions:
   CreateS3Bucket: !Equals [!Ref EnableS3Results, 'true']
   CreateSNSTopic: !Equals [!Ref EnableSNSNotifications, 'true']
@@ -407,6 +415,7 @@ Resources:
           SCAN_TIMEOUT: '300'
           CACHE_TTL_DAYS: !Ref CacheTTLDays
           QSCANNER_PATH: '/opt/bin/qscanner'
+          ENABLE_QUALYS_TAGGING: !Ref EnableQualysTagging
       Code:
         ZipFile: |
           # Placeholder - replace with actual code via S3 or inline
