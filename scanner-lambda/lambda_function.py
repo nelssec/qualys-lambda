@@ -6,8 +6,11 @@ import logging
 import re
 import glob
 import time
+import random
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from functools import wraps
+from typing import Dict, Any, Optional, Callable
+from botocore.exceptions import ClientError, BotoCoreError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -41,6 +44,10 @@ QSCANNER_PATH = os.environ.get('QSCANNER_PATH', '/opt/bin/qscanner')
 if not QSCANNER_PATH:
     logger.error("QSCANNER_PATH is empty, using default /opt/bin/qscanner")
     QSCANNER_PATH = '/opt/bin/qscanner'
+
+SCANNER_EXTERNAL_ID = os.environ.get('SCANNER_EXTERNAL_ID')
+if not SCANNER_EXTERNAL_ID:
+    logger.warning("SCANNER_EXTERNAL_ID not set - cross-account scanning will fail")
 
 
 class ScanException(Exception):
@@ -157,7 +164,9 @@ def publish_custom_metrics(metric_data: Dict[str, Any]) -> None:
         logger.error(f"Failed to publish custom metrics: {e}")
 
 
+@aws_retry(max_retries=5, initial_delay=0.5)
 def get_qualys_credentials() -> Dict[str, str]:
+    """Retrieve Qualys credentials from Secrets Manager with retry."""
     response = secrets_manager.get_secret_value(SecretId=QUALYS_SECRET_ARN)
     secret = json.loads(response['SecretString'])
 
@@ -176,18 +185,25 @@ def get_qualys_credentials() -> Dict[str, str]:
     return secret
 
 
+@aws_retry(max_retries=5, initial_delay=0.5)
+def _get_cache_item(table, function_arn: str) -> Optional[Dict]:
+    """Get item from DynamoDB cache with retry."""
+    response = table.get_item(Key={'function_arn': function_arn})
+    return response.get('Item')
+
+
 def check_scan_cache(function_arn: str, code_sha256: str) -> bool:
+    """Check if function has been scanned recently with same code hash."""
     if not SCAN_CACHE_TABLE or not code_sha256:
         return False
 
     try:
         table = dynamodb.Table(SCAN_CACHE_TABLE)
-        response = table.get_item(Key={'function_arn': function_arn})
+        item = _get_cache_item(table, function_arn)
 
-        if 'Item' not in response:
+        if not item:
             return False
 
-        item = response['Item']
         cached_sha256 = item.get('code_sha256')
         scan_timestamp = item.get('scan_timestamp')
 
@@ -211,7 +227,14 @@ def check_scan_cache(function_arn: str, code_sha256: str) -> bool:
         return False
 
 
+@aws_retry(max_retries=5, initial_delay=0.5)
+def _put_cache_item(table, item: Dict) -> None:
+    """Put item to DynamoDB cache with retry."""
+    table.put_item(Item=item)
+
+
 def update_scan_cache(function_arn: str, lambda_details: Dict[str, Any], scan_results: Dict[str, Any]) -> None:
+    """Update scan cache with latest scan results."""
     if not SCAN_CACHE_TABLE:
         return
 
@@ -219,38 +242,54 @@ def update_scan_cache(function_arn: str, lambda_details: Dict[str, Any], scan_re
         table = dynamodb.Table(SCAN_CACHE_TABLE)
         timestamp = datetime.utcnow()
 
-        table.put_item(
-            Item={
-                'function_arn': function_arn,
-                'code_sha256': lambda_details.get('code_sha256'),
-                'scan_timestamp': timestamp.isoformat(),
-                'function_name': lambda_details.get('function_name'),
-                'package_type': lambda_details.get('package_type'),
-                'runtime': lambda_details.get('runtime'),
-                'last_modified': lambda_details.get('last_modified'),
-                'scan_success': scan_results.get('success'),
-                'ttl': int((timestamp + timedelta(days=CACHE_TTL_DAYS)).timestamp())
-            }
-        )
+        item = {
+            'function_arn': function_arn,
+            'code_sha256': lambda_details.get('code_sha256'),
+            'scan_timestamp': timestamp.isoformat(),
+            'function_name': lambda_details.get('function_name'),
+            'package_type': lambda_details.get('package_type'),
+            'runtime': lambda_details.get('runtime'),
+            'last_modified': lambda_details.get('last_modified'),
+            'scan_success': scan_results.get('success'),
+            'ttl': int((timestamp + timedelta(days=CACHE_TTL_DAYS)).timestamp())
+        }
 
+        _put_cache_item(table, item)
         logger.info(f"Updated scan cache for {function_arn}")
 
     except Exception as e:
         logger.error(f"Failed to update scan cache: {e}")
 
 
+@aws_retry(max_retries=5, initial_delay=0.5)
+def _assume_role(role_arn: str, session_name: str, external_id: str) -> Dict:
+    """Assume IAM role with retry."""
+    return sts_client.assume_role(
+        RoleArn=role_arn,
+        RoleSessionName=session_name,
+        DurationSeconds=900,
+        ExternalId=external_id
+    )
+
+
+@aws_retry(max_retries=5, initial_delay=0.5)
+def _get_lambda_function(client, function_arn: str) -> Dict:
+    """Get Lambda function details with retry."""
+    return client.get_function(FunctionName=function_arn)
+
+
 def get_lambda_details(function_arn: str, cross_account_role: Optional[str] = None) -> Dict[str, Any]:
+    """Get Lambda function details, optionally assuming cross-account role."""
     if cross_account_role:
         # Validate cross-account role ARN before attempting to assume it
         if not validate_role_arn(cross_account_role):
             raise ValueError(f"Invalid cross-account role ARN format: {cross_account_role[:50]}...")
 
         logger.info(f"Assuming cross-account role: {cross_account_role}")
-        assumed_role = sts_client.assume_role(
-            RoleArn=cross_account_role,
-            RoleSessionName='QScannerSession',
-            DurationSeconds=900,  # Minimum duration for security
-            ExternalId='qualys-lambda-scanner'  # Required by spoke role for confused deputy protection
+        assumed_role = _assume_role(
+            cross_account_role,
+            'QScannerSession',
+            SCANNER_EXTERNAL_ID
         )
 
         lambda_client_temp = boto3.client(
@@ -262,7 +301,7 @@ def get_lambda_details(function_arn: str, cross_account_role: Optional[str] = No
     else:
         lambda_client_temp = lambda_client
 
-    response = lambda_client_temp.get_function(FunctionName=function_arn)
+    response = _get_lambda_function(lambda_client_temp, function_arn)
     function_config = response['Configuration']
 
     logger.info(f"Retrieved details for Lambda: {function_config['FunctionName']}")
@@ -281,34 +320,79 @@ def get_lambda_details(function_arn: str, cross_account_role: Optional[str] = No
     }
 
 
-def retry_with_backoff(func, max_retries=3, initial_delay=2):
-    """Retry a function with exponential backoff for transient failures"""
+def retry_with_backoff(func, max_retries=5, initial_delay=1, max_delay=30, jitter=True):
+    """Retry a function with exponential backoff and jitter."""
     for attempt in range(max_retries):
         try:
             return func()
         except subprocess.CalledProcessError as e:
             # Only retry on specific exit codes that indicate transient failures
-            # Exit codes like network errors, temporary service unavailability
             if attempt < max_retries - 1 and e.returncode in [1, 2, 124, 137]:
-                delay = initial_delay * (2 ** attempt)
-                logger.warning(f"Attempt {attempt + 1} failed with exit code {e.returncode}, retrying in {delay}s...")
+                delay = min(initial_delay * (2 ** attempt), max_delay)
+                if jitter:
+                    delay = delay * (0.5 + random.random())  # 50-150% of calculated delay
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed with exit code {e.returncode}, retrying in {delay:.1f}s...")
                 time.sleep(delay)
             else:
                 raise
         except Exception as e:
-            # For other exceptions, only retry on specific transient errors
             error_str = str(e).lower()
             is_transient = any(keyword in error_str for keyword in [
-                'timeout', 'connection', 'network', 'throttl', 'rate limit', 'service unavailable'
+                'timeout', 'connection', 'network', 'throttl', 'rate limit',
+                'service unavailable', 'internal error', 'try again'
             ])
             if attempt < max_retries - 1 and is_transient:
-                delay = initial_delay * (2 ** attempt)
-                logger.warning(f"Attempt {attempt + 1} failed with transient error, retrying in {delay}s: {e}")
+                delay = min(initial_delay * (2 ** attempt), max_delay)
+                if jitter:
+                    delay = delay * (0.5 + random.random())
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed with transient error, retrying in {delay:.1f}s: {e}")
                 time.sleep(delay)
             else:
                 raise
-    # This should never be reached, but just in case
     raise ScanException("Max retries exceeded")
+
+
+def aws_retry(max_retries: int = 5, initial_delay: float = 0.5, max_delay: float = 30):
+    """Decorator for retrying AWS API calls with exponential backoff and jitter."""
+    def decorator(func: Callable):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except ClientError as e:
+                    error_code = e.response.get('Error', {}).get('Code', '')
+                    # Retryable error codes
+                    retryable_codes = [
+                        'Throttling', 'ThrottlingException', 'RequestThrottled',
+                        'ProvisionedThroughputExceededException', 'ServiceUnavailable',
+                        'InternalError', 'InternalServiceError', 'RequestLimitExceeded',
+                        'TooManyRequestsException', 'TransactionConflictException'
+                    ]
+                    if error_code in retryable_codes and attempt < max_retries - 1:
+                        delay = min(initial_delay * (2 ** attempt), max_delay)
+                        delay = delay * (0.5 + random.random())  # Add jitter
+                        logger.warning(f"AWS API {func.__name__} attempt {attempt + 1}/{max_retries} failed with {error_code}, retrying in {delay:.1f}s")
+                        time.sleep(delay)
+                        last_exception = e
+                    else:
+                        raise
+                except BotoCoreError as e:
+                    # Network-level errors
+                    if attempt < max_retries - 1:
+                        delay = min(initial_delay * (2 ** attempt), max_delay)
+                        delay = delay * (0.5 + random.random())
+                        logger.warning(f"AWS API {func.__name__} attempt {attempt + 1}/{max_retries} failed with {type(e).__name__}, retrying in {delay:.1f}s")
+                        time.sleep(delay)
+                        last_exception = e
+                    else:
+                        raise
+            if last_exception:
+                raise last_exception
+            raise ScanException(f"Max retries exceeded for {func.__name__}")
+        return wrapper
+    return decorator
 
 
 def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: str) -> Dict[str, Any]:
@@ -460,7 +544,29 @@ def tag_lambda_function(function_arn: str, repo_tag: Optional[str], scan_timesta
         logger.error(f"Failed to tag Lambda function: {e}")
 
 
+@aws_retry(max_retries=5, initial_delay=0.5)
+def _s3_put_object(bucket: str, key: str, body: str) -> None:
+    """Put object to S3 with retry."""
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=body,
+        ContentType='application/json'
+    )
+
+
+@aws_retry(max_retries=5, initial_delay=0.5)
+def _sns_publish(topic_arn: str, subject: str, message: str) -> None:
+    """Publish to SNS with retry."""
+    sns_client.publish(
+        TopicArn=topic_arn,
+        Subject=subject,
+        Message=message
+    )
+
+
 def store_results(lambda_details: Dict[str, Any], scan_results: Dict[str, Any]) -> None:
+    """Store scan results to S3 and send SNS notification."""
     timestamp = datetime.utcnow().isoformat()
 
     full_results = {
@@ -472,12 +578,10 @@ def store_results(lambda_details: Dict[str, Any], scan_results: Dict[str, Any]) 
     if RESULTS_S3_BUCKET:
         try:
             key = f"scans/{lambda_details['function_name']}/{timestamp}.json"
-            s3_client.put_object(
-                Bucket=RESULTS_S3_BUCKET,
-                Key=key,
-                Body=json.dumps(full_results, indent=2),
-                ContentType='application/json',
-                ServerSideEncryption='AES256'
+            _s3_put_object(
+                RESULTS_S3_BUCKET,
+                key,
+                json.dumps(full_results, indent=2)
             )
             logger.info(f"Stored results in S3: s3://{RESULTS_S3_BUCKET}/{key}")
         except Exception as e:
@@ -497,10 +601,10 @@ def store_results(lambda_details: Dict[str, Any], scan_results: Dict[str, Any]) 
                 vuln_summary = scan_results['results'].get('vulnerabilities', {})
                 message['vulnerability_summary'] = vuln_summary
 
-            sns_client.publish(
-                TopicArn=SNS_TOPIC_ARN,
-                Subject=f"QScanner Results: {lambda_details['function_name']}",
-                Message=json.dumps(message, indent=2)
+            _sns_publish(
+                SNS_TOPIC_ARN,
+                f"QScanner Results: {lambda_details['function_name']}",
+                json.dumps(message, indent=2)
             )
             logger.info(f"Sent notification to SNS: {SNS_TOPIC_ARN}")
         except Exception as e:

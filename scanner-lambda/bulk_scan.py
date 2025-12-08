@@ -17,8 +17,11 @@ Usage:
 Environment Variables:
 - SCANNER_FUNCTION_NAME: Name of the scanner Lambda to invoke
 - CROSS_ACCOUNT_ROLE_NAME: Role name to assume in spoke accounts (optional)
+- SCANNER_EXTERNAL_ID: External ID for cross-account role assumption
 - EXCLUDE_PATTERNS: Comma-separated function name patterns to exclude
-- INVOCATION_DELAY_MS: Delay between invocations to avoid throttling (default: 100)
+- INVOCATION_DELAY_MS: Delay between batches in ms (default: 100)
+- MAX_WORKERS: Number of parallel invocation threads (default: 10)
+- BATCH_SIZE: Functions per batch before pause (default: 100)
 """
 
 import boto3
@@ -27,7 +30,8 @@ import logging
 import os
 import re
 import time
-from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -39,8 +43,11 @@ sts_client = boto3.client('sts')
 # Environment variables
 SCANNER_FUNCTION_NAME = os.environ.get('SCANNER_FUNCTION_NAME', '')
 CROSS_ACCOUNT_ROLE_NAME = os.environ.get('CROSS_ACCOUNT_ROLE_NAME', '')
+SCANNER_EXTERNAL_ID = os.environ.get('SCANNER_EXTERNAL_ID', '')
 EXCLUDE_PATTERNS = os.environ.get('EXCLUDE_PATTERNS', 'qualys-lambda-scanner,bulk-scan').split(',')
 INVOCATION_DELAY_MS = int(os.environ.get('INVOCATION_DELAY_MS', '100'))
+MAX_WORKERS = int(os.environ.get('MAX_WORKERS', '10'))  # Parallel invocation threads
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '100'))  # Functions per batch before pause
 
 # Validation patterns
 ACCOUNT_ID_PATTERN = re.compile(r'^\d{12}$')
@@ -51,9 +58,9 @@ def validate_account_id(account_id: str) -> bool:
     return bool(ACCOUNT_ID_PATTERN.match(account_id))
 
 
-def should_exclude(function_name: str) -> bool:
+def should_exclude(function_name: str, exclude_patterns: list) -> bool:
     """Check if function should be excluded from scanning."""
-    for pattern in EXCLUDE_PATTERNS:
+    for pattern in exclude_patterns:
         pattern = pattern.strip()
         if pattern and pattern in function_name:
             return True
@@ -75,7 +82,7 @@ def get_lambda_client_for_account(account_id: str) -> Optional[boto3.client]:
             RoleArn=role_arn,
             RoleSessionName='BulkScanSession',
             DurationSeconds=3600,
-            ExternalId='qualys-lambda-scanner'
+            ExternalId=SCANNER_EXTERNAL_ID
         )
 
         return boto3.client(
@@ -89,8 +96,8 @@ def get_lambda_client_for_account(account_id: str) -> Optional[boto3.client]:
         return None
 
 
-def list_all_functions(client: boto3.client) -> List[Dict[str, Any]]:
-    """List all Lambda functions using pagination."""
+def list_all_functions(client: boto3.client, exclude_patterns: list) -> List[Dict[str, Any]]:
+    """List all Lambda functions using pagination with generator for memory efficiency."""
     functions = []
     paginator = client.get_paginator('list_functions')
 
@@ -99,7 +106,7 @@ def list_all_functions(client: boto3.client) -> List[Dict[str, Any]]:
             function_name = func.get('FunctionName', '')
 
             # Skip excluded functions
-            if should_exclude(function_name):
+            if should_exclude(function_name, exclude_patterns):
                 logger.debug(f"Excluding function: {function_name}")
                 continue
 
@@ -114,11 +121,17 @@ def list_all_functions(client: boto3.client) -> List[Dict[str, Any]]:
     return functions
 
 
-def invoke_scanner(func: Dict[str, Any], source_account: str) -> bool:
-    """Invoke scanner Lambda asynchronously for a single function."""
+def invoke_scanner(func: Dict[str, Any], source_account: str) -> Tuple[bool, str]:
+    """Invoke scanner Lambda asynchronously for a single function.
+
+    Returns:
+        Tuple of (success: bool, function_name: str)
+    """
+    function_name = func.get('FunctionName', 'unknown')
+
     if not SCANNER_FUNCTION_NAME:
         logger.error("SCANNER_FUNCTION_NAME not configured")
-        return False
+        return False, function_name
 
     # Create a synthetic CloudTrail-like event for the scanner
     scan_event = {
@@ -132,7 +145,7 @@ def invoke_scanner(func: Dict[str, Any], source_account: str) -> bool:
             },
             'responseElements': {
                 'functionArn': func['FunctionArn'],
-                'functionName': func['FunctionName'],
+                'functionName': function_name,
                 'codeSha256': func['CodeSha256'],
                 'runtime': func['Runtime'],
                 'packageType': func['PackageType']
@@ -149,10 +162,42 @@ def invoke_scanner(func: Dict[str, Any], source_account: str) -> bool:
             InvocationType='Event',  # Async invocation
             Payload=json.dumps(scan_event)
         )
-        return True
+        return True, function_name
     except Exception as e:
-        logger.error(f"Failed to invoke scanner for {func['FunctionName']}: {e}")
-        return False
+        logger.error(f"Failed to invoke scanner for {function_name}: {e}")
+        return False, function_name
+
+
+def invoke_batch_parallel(functions: List[Dict[str, Any]], account_id: str) -> Tuple[int, int]:
+    """Invoke scanner for a batch of functions in parallel.
+
+    Returns:
+        Tuple of (invoked_count, failed_count)
+    """
+    invoked = 0
+    failed = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all tasks
+        future_to_func = {
+            executor.submit(invoke_scanner, func, account_id): func
+            for func in functions
+        }
+
+        # Collect results as they complete
+        for future in as_completed(future_to_func):
+            try:
+                success, func_name = future.result()
+                if success:
+                    invoked += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                func = future_to_func[future]
+                logger.error(f"Exception invoking scanner for {func.get('FunctionName', 'unknown')}: {e}")
+                failed += 1
+
+    return invoked, failed
 
 
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
@@ -180,9 +225,8 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     dry_run = event.get('dry_run', False)
     additional_excludes = event.get('exclude_patterns', [])
 
-    # Add additional exclude patterns
-    global EXCLUDE_PATTERNS
-    EXCLUDE_PATTERNS = EXCLUDE_PATTERNS + additional_excludes
+    # Create local exclude patterns list (avoid modifying global for thread safety)
+    exclude_patterns = list(EXCLUDE_PATTERNS) + additional_excludes
 
     results = {
         'accounts_processed': 0,
@@ -227,7 +271,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                     continue
 
             # List all functions
-            functions = list_all_functions(list_client)
+            functions = list_all_functions(list_client, exclude_patterns)
             function_count = len(functions)
             results['total_functions'] += function_count
 
@@ -240,19 +284,27 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                     'functions': function_count
                 })
             else:
-                # Invoke scanner for each function
+                # Invoke scanner in parallel batches for performance at scale
                 invoked = 0
                 failed = 0
 
-                for func in functions:
-                    if invoke_scanner(func, account_id):
-                        invoked += 1
-                    else:
-                        failed += 1
+                # Process in batches to avoid overwhelming Lambda service
+                for i in range(0, len(functions), BATCH_SIZE):
+                    batch = functions[i:i + BATCH_SIZE]
+                    batch_num = (i // BATCH_SIZE) + 1
+                    total_batches = (len(functions) + BATCH_SIZE - 1) // BATCH_SIZE
 
-                    # Small delay to avoid throttling
-                    if INVOCATION_DELAY_MS > 0:
-                        time.sleep(INVOCATION_DELAY_MS / 1000.0)
+                    logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} functions)")
+
+                    batch_invoked, batch_failed = invoke_batch_parallel(batch, account_id)
+                    invoked += batch_invoked
+                    failed += batch_failed
+
+                    # Pause between batches to avoid throttling
+                    if i + BATCH_SIZE < len(functions) and INVOCATION_DELAY_MS > 0:
+                        pause_seconds = (INVOCATION_DELAY_MS * BATCH_SIZE) / 1000.0
+                        logger.info(f"Pausing {pause_seconds:.1f}s between batches")
+                        time.sleep(pause_seconds)
 
                 results['invoked'] += invoked
                 results['failed'] += failed

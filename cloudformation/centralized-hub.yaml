@@ -128,6 +128,13 @@ Parameters:
     Description: 'S3 key for bulk scan Lambda code zip'
     Default: 'qualys-lambda-scanner/bulk-scan.zip'
 
+  ScannerExternalId:
+    Type: String
+    Description: 'External ID for cross-account role assumption (must match spoke deployments)'
+    MinLength: 16
+    MaxLength: 128
+    NoEcho: true
+
 Conditions:
   CreateS3Bucket: !Equals [!Ref EnableS3Results, 'true']
   CreateSNSTopic: !Equals [!Ref EnableSNSNotifications, 'true']
@@ -243,7 +250,9 @@ Resources:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref ScannerKMSKey
+            BucketKeyEnabled: true
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -381,7 +390,7 @@ Resources:
                   - secretsmanager:GetSecretValue
                 Resource: !Ref QualysCredentialsSecret
 
-              # STS Assume Role (for cross-account access)
+              # STS Assume Role (cross-account) - spoke trust policy enforces security
               - Sid: AssumeRoleInSpokeAccounts
                 Effect: Allow
                 Action:
@@ -464,7 +473,7 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-scanner'
-      RetentionInDays: 30
+      RetentionInDays: 90
       KmsKeyId: !GetAtt ScannerKMSKey.Arn
 
   # Lambda Layer containing QScanner binary
@@ -517,6 +526,7 @@ Resources:
           SCAN_TIMEOUT: '300'
           CACHE_TTL_DAYS: !Ref CacheTTLDays
           CROSS_ACCOUNT_ROLE_NAME: 'qualys-lambda-scanner-spoke-role'
+          SCANNER_EXTERNAL_ID: !Ref ScannerExternalId
           QSCANNER_PATH: '/opt/bin/qscanner'
       Tags:
         - Key: Name
@@ -624,6 +634,7 @@ Resources:
         Variables:
           SCANNER_FUNCTION_NAME: !Ref ScannerLambdaFunction
           CROSS_ACCOUNT_ROLE_NAME: 'qualys-lambda-scanner-spoke-role'
+          SCANNER_EXTERNAL_ID: !Ref ScannerExternalId
           EXCLUDE_PATTERNS: !Sub '${AWS::StackName}-scanner,${AWS::StackName}-bulk-scan'
           INVOCATION_DELAY_MS: '100'
       Tags:
@@ -638,7 +649,7 @@ Resources:
     Condition: CreateBulkScan
     Properties:
       LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-bulk-scan'
-      RetentionInDays: 7
+      RetentionInDays: 90
       KmsKeyId: !GetAtt ScannerKMSKey.Arn
 
   # EventBridge Rule for scheduled bulk scans (optional)
@@ -745,6 +756,71 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: !Ref ScannerLambdaFunction
+      AlarmActions:
+        - !Ref ScanNotificationsTopic
+
+  # DynamoDB Throttling Alarm
+  DynamoDBThrottlingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateScanCache
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-dynamodb-throttling'
+      AlarmDescription: 'DynamoDB requests being throttled - may need capacity increase'
+      MetricName: ThrottledRequests
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: TableName
+          Value: !Ref ScanCacheTable
+      AlarmActions: !If
+        - CreateSNSTopic
+        - - !Ref ScanNotificationsTopic
+        - !Ref AWS::NoValue
+
+  # Lambda Concurrent Executions Alarm
+  ScannerConcurrencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSTopic
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-scanner-concurrency'
+      AlarmDescription: 'Scanner Lambda approaching reserved concurrency limit'
+      MetricName: ConcurrentExecutions
+      Namespace: AWS/Lambda
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      # Alert when reaching 80% of reserved concurrency
+      Threshold: !Sub
+        - '${ConcurrencyThreshold}'
+        - ConcurrencyThreshold: !Join ['', [!Ref ScannerReservedConcurrency, '']]
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ScannerLambdaFunction
+      AlarmActions:
+        - !Ref ScanNotificationsTopic
+
+  # Scan Success Rate Alarm (using custom metric from Lambda)
+  ScanSuccessRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSTopic
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-scan-success-rate'
+      AlarmDescription: 'Low scan success rate - investigate failures'
+      MetricName: ScanSuccess
+      Namespace: QualysLambdaScanner
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 0.9
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
       AlarmActions:
         - !Ref ScanNotificationsTopic
 

@@ -6,6 +6,13 @@ Parameters:
     Type: String
     Description: 'AWS Account ID of the central security account'
 
+  ScannerExternalId:
+    Type: String
+    Description: 'External ID for cross-account role assumption (must match hub deployment)'
+    MinLength: 16
+    MaxLength: 128
+    NoEcho: true
+
   CentralEventBusName:
     Type: String
     Description: 'Name of the central EventBridge bus in the security account'
@@ -31,7 +38,7 @@ Resources:
             Action: sts:AssumeRole
             Condition:
               StringEquals:
-                sts:ExternalId: 'qualys-lambda-scanner'
+                sts:ExternalId: !Ref ScannerExternalId
       Policies:
         - PolicyName: LambdaAndECRAccess
           PolicyDocument:
