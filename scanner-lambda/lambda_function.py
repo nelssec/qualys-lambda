@@ -361,14 +361,16 @@ def search_tag_by_name(
     password: str,
     tag_name: str,
     parent_tag_id: Optional[str] = None
-) -> Optional[str]:
-    """Search for a tag by name and optionally parent, return its UUID.
+) -> Optional[Tuple[str, str]]:
+    """Search for a tag by name and optionally parent, return (id, uuid) tuple.
 
     Args:
-        parent_tag_id: If provided, only return tag if it's a child of this parent
+        parent_tag_id: If provided, only return tag if it's a child of this parent (uses integer ID)
 
     Returns:
-        Tag UUID or None if not found
+        Tuple of (tag_id, tag_uuid) or None if not found
+        - tag_id: integer ID for use as parentTagId
+        - tag_uuid: UUID for use in CS API tag assignment
     """
     # Check cache first (include parent in cache key for uniqueness)
     cache_key = f"tag:{parent_tag_id or 'root'}:{tag_name}"
@@ -402,27 +404,26 @@ def search_tag_by_name(
                     # Log all available tag fields for debugging
                     logger.info(f"AM API tag fields: {list(tag.keys())}")
 
-                    # Prefer UUID format, fall back to id
-                    tag_uuid = tag.get('uuid') or tag.get('tagUuid') or tag.get('id')
-                    tag_id = tag.get('id')
+                    # Get both id (integer) and uuid
+                    tag_id = tag.get('id')  # Integer ID for parentTagId
+                    tag_uuid = tag.get('tagUuid') or tag.get('uuid')  # UUID for CS API
                     tag_parent_id = tag.get('parentTagId')
 
-                    if not tag_uuid and not tag_id:
+                    if not tag_id:
                         continue
-
-                    # Use UUID if available, otherwise use id
-                    result_id = str(tag_uuid) if tag_uuid else str(tag_id)
 
                     # If parent specified, only match if parent matches
                     if parent_tag_id:
                         if str(tag_parent_id) == str(parent_tag_id):
-                            _qualys_tag_cache[cache_key] = result_id
-                            return result_id
+                            result = (str(tag_id), str(tag_uuid) if tag_uuid else str(tag_id))
+                            _qualys_tag_cache[cache_key] = result
+                            return result
                     else:
                         # No parent specified - return first match (for root-level tags)
                         if not tag_parent_id:
-                            _qualys_tag_cache[cache_key] = result_id
-                            return result_id
+                            result = (str(tag_id), str(tag_uuid) if tag_uuid else str(tag_id))
+                            _qualys_tag_cache[cache_key] = result
+                            return result
 
         except (KeyError, IndexError, TypeError) as e:
             logger.error(f"Error parsing tag search response: {e}")
@@ -436,11 +437,16 @@ def create_tag(
     password: str,
     tag_name: str,
     parent_tag_id: Optional[str] = None
-) -> Optional[str]:
+) -> Optional[Tuple[str, str]]:
     """Create a new tag in Qualys.
 
+    Args:
+        parent_tag_id: Integer ID of parent tag (not UUID)
+
     Returns:
-        New tag UUID or None on failure
+        Tuple of (tag_id, tag_uuid) or None on failure
+        - tag_id: integer ID for use as parentTagId
+        - tag_uuid: UUID for use in CS API tag assignment
     """
     # Validate tag name
     if not validate_qualys_tag_name(tag_name):
@@ -460,7 +466,8 @@ def create_tag(
     }
 
     if parent_tag_id:
-        tag_data["ServiceRequest"]["data"]["Tag"]["parentTagId"] = parent_tag_id
+        # parentTagId must be an integer, not UUID
+        tag_data["ServiceRequest"]["data"]["Tag"]["parentTagId"] = int(parent_tag_id)
 
     logger.info(f"Creating tag: name='{tag_name}', parent_id={parent_tag_id}")
     status, response = qualys_api_request(gateway_url, endpoint, username, password, 'POST', tag_data)
@@ -470,15 +477,17 @@ def create_tag(
             tag = response.get('ServiceResponse', {}).get('data', [{}])[0].get('Tag', {})
             # Log all available tag fields for debugging
             logger.info(f"AM API create tag fields: {list(tag.keys())}")
-            # Prefer UUID format, fall back to id
-            tag_uuid = tag.get('uuid') or tag.get('tagUuid') or tag.get('id')
-            if tag_uuid:
+            # Get both id and uuid
+            tag_id = tag.get('id')
+            tag_uuid = tag.get('tagUuid') or tag.get('uuid')
+            if tag_id:
                 cache_key = f"tag:{parent_tag_id or 'root'}:{tag_name}"
-                _qualys_tag_cache[cache_key] = str(tag_uuid)
-                logger.info(f"Created Qualys tag: {tag_name} -> {tag_uuid}")
-                return str(tag_uuid)
+                result = (str(tag_id), str(tag_uuid) if tag_uuid else str(tag_id))
+                _qualys_tag_cache[cache_key] = result
+                logger.info(f"Created Qualys tag: {tag_name} -> id={tag_id}, uuid={tag_uuid}")
+                return result
             else:
-                logger.error(f"Tag created but no ID/UUID in response: {response}")
+                logger.error(f"Tag created but no ID in response: {response}")
         except (KeyError, IndexError, TypeError) as e:
             logger.error(f"Unexpected tag create response format: {e}")
     elif status == 401:
@@ -502,22 +511,24 @@ def create_tag(
                     existing_tag = response.get('Tag', {})
 
                 if existing_tag:
-                    tag_uuid = existing_tag.get('uuid') or existing_tag.get('tagUuid') or existing_tag.get('id')
-                    if tag_uuid:
+                    tag_id = existing_tag.get('id')
+                    tag_uuid = existing_tag.get('tagUuid') or existing_tag.get('uuid')
+                    if tag_id:
                         cache_key = f"tag:{parent_tag_id or 'root'}:{tag_name}"
-                        _qualys_tag_cache[cache_key] = str(tag_uuid)
-                        logger.info(f"Extracted existing tag ID from 409 response: {tag_name} -> {tag_uuid}")
-                        return str(tag_uuid)
+                        result = (str(tag_id), str(tag_uuid) if tag_uuid else str(tag_id))
+                        _qualys_tag_cache[cache_key] = result
+                        logger.info(f"Extracted existing tag from 409 response: {tag_name} -> id={tag_id}, uuid={tag_uuid}")
+                        return result
             except Exception as e:
                 logger.warning(f"Failed to extract tag ID from 409 response: {e}")
 
         # Fall back to searching for the tag with retries
         logger.info(f"Searching for existing tag: {tag_name}")
         for attempt in range(3):
-            tag_uuid = search_tag_by_name(gateway_url, username, password, tag_name, parent_tag_id)
-            if tag_uuid:
-                logger.info(f"Found existing tag via search: {tag_name} -> {tag_uuid}")
-                return tag_uuid
+            result = search_tag_by_name(gateway_url, username, password, tag_name, parent_tag_id)
+            if result:
+                logger.info(f"Found existing tag via search: {tag_name} -> id={result[0]}, uuid={result[1]}")
+                return result
             if attempt < 2:
                 time.sleep(1)  # Brief delay before retry
 
@@ -535,19 +546,24 @@ def get_or_create_tag(
     password: str,
     tag_name: str,
     parent_tag_id: Optional[str] = None
-) -> Optional[str]:
+) -> Optional[Tuple[str, str]]:
     """Get existing tag or create new one.
 
+    Args:
+        parent_tag_id: Integer ID of parent tag (not UUID)
+
     Returns:
-        Tag UUID or None on failure
+        Tuple of (tag_id, tag_uuid) or None on failure
+        - tag_id: integer ID for use as parentTagId
+        - tag_uuid: UUID for use in CS API tag assignment
     """
     logger.info(f"get_or_create_tag: name='{tag_name}', parent_id={parent_tag_id}")
 
     # Try to find existing tag with parent context
-    tag_uuid = search_tag_by_name(gateway_url, username, password, tag_name, parent_tag_id)
-    if tag_uuid:
-        logger.info(f"Found existing tag: {tag_name} -> {tag_uuid}")
-        return tag_uuid
+    result = search_tag_by_name(gateway_url, username, password, tag_name, parent_tag_id)
+    if result:
+        logger.info(f"Found existing tag: {tag_name} -> id={result[0]}, uuid={result[1]}")
+        return result
 
     # Create new tag
     logger.info(f"Tag not found, creating: {tag_name}")
@@ -568,7 +584,7 @@ def ensure_tag_hierarchy(
             └── <full_arn> (child)
 
     Returns:
-        The ARN tag UUID or None on failure
+        The ARN tag UUID (for use in CS API tag assignment) or None on failure
     """
     # Parse the ARN
     # arn:aws:lambda:<region>:<account_id>:function:<function_name>
@@ -588,30 +604,34 @@ def ensure_tag_hierarchy(
 
     # Step 1: Get or create parent "Lambda" tag (root level)
     logger.info("Step 1: Getting/creating root 'Lambda' tag...")
-    lambda_tag_id = get_or_create_tag(gateway_url, username, password, "Lambda")
-    if not lambda_tag_id:
+    lambda_tag_result = get_or_create_tag(gateway_url, username, password, "Lambda")
+    if not lambda_tag_result:
         logger.error("Failed to get/create Lambda parent tag")
         return None
-    logger.info(f"Lambda tag ID: {lambda_tag_id}")
+    lambda_tag_id, lambda_tag_uuid = lambda_tag_result
+    logger.info(f"Lambda tag: id={lambda_tag_id}, uuid={lambda_tag_uuid}")
 
-    # Step 2: Get or create region tag under Lambda
+    # Step 2: Get or create region tag under Lambda (use integer ID as parent)
     logger.info(f"Step 2: Getting/creating region tag '{region}' under Lambda...")
-    region_tag_id = get_or_create_tag(gateway_url, username, password, region, lambda_tag_id)
-    if not region_tag_id:
+    region_tag_result = get_or_create_tag(gateway_url, username, password, region, lambda_tag_id)
+    if not region_tag_result:
         logger.error(f"Failed to get/create region tag: {region}")
         return None
-    logger.info(f"Region tag ID: {region_tag_id}")
+    region_tag_id, region_tag_uuid = region_tag_result
+    logger.info(f"Region tag: id={region_tag_id}, uuid={region_tag_uuid}")
 
-    # Step 3: Get or create ARN tag under region
+    # Step 3: Get or create ARN tag under region (use integer ID as parent)
     logger.info(f"Step 3: Getting/creating ARN tag under region...")
-    arn_tag_id = get_or_create_tag(gateway_url, username, password, arn_tag_name, region_tag_id)
-    if not arn_tag_id:
+    arn_tag_result = get_or_create_tag(gateway_url, username, password, arn_tag_name, region_tag_id)
+    if not arn_tag_result:
         logger.error(f"Failed to get/create ARN tag: {arn_tag_name}")
         return None
-    logger.info(f"ARN tag ID: {arn_tag_id}")
+    arn_tag_id, arn_tag_uuid = arn_tag_result
+    logger.info(f"ARN tag: id={arn_tag_id}, uuid={arn_tag_uuid}")
 
     logger.info(f"Tag hierarchy complete: Lambda({lambda_tag_id}) -> {region}({region_tag_id}) -> ARN({arn_tag_id})")
-    return arn_tag_id
+    # Return the UUID for use in CS API tag assignment
+    return arn_tag_uuid
 
 
 def assign_tag_to_image(
