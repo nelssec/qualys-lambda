@@ -7,9 +7,12 @@ import re
 import glob
 import time
 import random
+import base64
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from functools import wraps
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Callable, Tuple
 from botocore.exceptions import ClientError, BotoCoreError
 
 logger = logging.getLogger()
@@ -48,6 +51,29 @@ if not QSCANNER_PATH:
 SCANNER_EXTERNAL_ID = os.environ.get('SCANNER_EXTERNAL_ID')
 if not SCANNER_EXTERNAL_ID:
     logger.warning("SCANNER_EXTERNAL_ID not set - cross-account scanning will fail")
+
+ENABLE_QUALYS_TAGGING = os.environ.get('ENABLE_QUALYS_TAGGING', 'false').lower() == 'true'
+
+# Qualys Pod to Gateway URL mapping
+QUALYS_GATEWAY_MAP = {
+    'US1': 'https://gateway.qg1.apps.qualys.com',
+    'US2': 'https://gateway.qg2.apps.qualys.com',
+    'US3': 'https://gateway.qg3.apps.qualys.com',
+    'US4': 'https://gateway.qg4.apps.qualys.com',
+    'GOV1': 'https://gateway.qg1.apps.qualys.com',  # GOV uses US infrastructure
+    'EU1': 'https://gateway.qg1.apps.qualys.eu',
+    'EU2': 'https://gateway.qg2.apps.qualys.eu',
+    'EU3': 'https://gateway.qg3.apps.qualys.it',
+    'IN1': 'https://gateway.qg1.apps.qualys.in',
+    'CA1': 'https://gateway.qg1.apps.qualys.ca',
+    'AE1': 'https://gateway.qg1.apps.qualys.ae',
+    'UK1': 'https://gateway.qg1.apps.qualys.co.uk',
+    'AU1': 'https://gateway.qg1.apps.qualys.com.au',
+    'KSA1': 'https://gateway.qg1.apps.qualysksa.com',
+}
+
+# Tag cache to avoid repeated API lookups
+_qualys_tag_cache: Dict[str, str] = {}
 
 
 class ScanException(Exception):
@@ -113,6 +139,415 @@ def sanitize_log_output(output: str) -> str:
     output = re.sub(r'[a-zA-Z0-9]{32,}', '[REDACTED]', output)
     output = re.sub(r'(token|password|secret|key)[\s:=]+\S+', r'\1=[REDACTED]', output, flags=re.IGNORECASE)
     return output
+
+
+# =============================================================================
+# Qualys Container Security API Client
+# =============================================================================
+
+def get_qualys_gateway_url(pod: str) -> str:
+    """Get the Qualys gateway URL for a given pod."""
+    pod_upper = pod.upper()
+    if pod_upper not in QUALYS_GATEWAY_MAP:
+        logger.warning(f"Unknown Qualys pod: {pod}, defaulting to US2")
+        return QUALYS_GATEWAY_MAP['US2']
+    return QUALYS_GATEWAY_MAP[pod_upper]
+
+
+def qualys_api_request(
+    gateway_url: str,
+    endpoint: str,
+    username: str,
+    password: str,
+    method: str = 'GET',
+    data: Optional[Dict] = None,
+    timeout: int = 30,
+    max_retries: int = 3
+) -> Tuple[int, Optional[Dict]]:
+    """Make a request to the Qualys CS API with retry logic.
+
+    Returns:
+        Tuple of (status_code, response_json or None)
+    """
+    url = f"{gateway_url}{endpoint}"
+    auth = base64.b64encode(f"{username}:{password}".encode()).decode()
+
+    headers = {
+        'Authorization': f'Basic {auth}',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    }
+
+    last_status = 0
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            if data:
+                body = json.dumps(data).encode('utf-8')
+            else:
+                body = None
+
+            request = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status_code = response.status
+                response_body = response.read().decode('utf-8')
+
+                if response_body:
+                    return status_code, json.loads(response_body)
+                return status_code, None
+
+        except urllib.error.HTTPError as e:
+            last_status = e.code
+            # Retry on 429 (rate limit), 500, 502, 503, 504
+            if e.code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
+                delay = (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"Qualys API {e.code}, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+                continue
+            logger.error(f"Qualys API HTTP error: {e.code} - {e.reason}")
+            try:
+                error_body = e.read().decode('utf-8')
+                logger.error(f"Error body: {error_body[:500]}")
+            except Exception:
+                pass
+            return e.code, None
+
+        except urllib.error.URLError as e:
+            last_error = e
+            # Retry on connection errors
+            if attempt < max_retries - 1:
+                delay = (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"Qualys API connection error, retrying in {delay:.1f}s: {e.reason}")
+                time.sleep(delay)
+                continue
+            logger.error(f"Qualys API URL error: {e.reason}")
+            return 0, None
+
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                delay = (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"Qualys API error, retrying in {delay:.1f}s: {e}")
+                time.sleep(delay)
+                continue
+            logger.error(f"Qualys API request failed: {e}")
+            return 0, None
+
+    logger.error(f"Qualys API max retries exceeded: status={last_status}, error={last_error}")
+    return last_status, None
+
+
+def get_image_by_sha(gateway_url: str, username: str, password: str, image_sha: str) -> Optional[Dict]:
+    """Get image details from Qualys CS by SHA256.
+
+    Returns:
+        Image details dict including 'uuid' or None if not found
+    """
+    # Remove 'sha256:' prefix if present
+    if image_sha.startswith('sha256:'):
+        image_sha = image_sha[7:]
+
+    endpoint = f"/csapi/v1.3/images/{image_sha}"
+    status, response = qualys_api_request(gateway_url, endpoint, username, password)
+
+    if status == 200 and response:
+        return response
+    elif status == 404:
+        logger.warning(f"Image not found in Qualys: {image_sha}")
+    else:
+        logger.error(f"Failed to get image from Qualys: status={status}")
+
+    return None
+
+
+def validate_qualys_tag_name(tag_name: str) -> bool:
+    """Validate tag name for Qualys compatibility.
+
+    Qualys tag names can be up to 1024 characters.
+    """
+    if not tag_name or not isinstance(tag_name, str):
+        return False
+    if len(tag_name) > 1024:
+        return False
+    # Allow alphanumeric, dash, underscore, dot, space, colon (for ARNs)
+    if not re.match(r'^[a-zA-Z0-9\-_.: ]+$', tag_name):
+        return False
+    return True
+
+
+def search_tag_by_name(
+    gateway_url: str,
+    username: str,
+    password: str,
+    tag_name: str,
+    parent_tag_id: Optional[str] = None
+) -> Optional[str]:
+    """Search for a tag by name and optionally parent, return its UUID.
+
+    Args:
+        parent_tag_id: If provided, only return tag if it's a child of this parent
+
+    Returns:
+        Tag UUID or None if not found
+    """
+    # Check cache first (include parent in cache key for uniqueness)
+    cache_key = f"tag:{parent_tag_id or 'root'}:{tag_name}"
+    if cache_key in _qualys_tag_cache:
+        return _qualys_tag_cache[cache_key]
+
+    # Search for tag by name
+    endpoint = "/qps/rest/2.0/search/am/tag"
+    search_data = {
+        "ServiceRequest": {
+            "filters": {
+                "Criteria": [
+                    {
+                        "field": "name",
+                        "operator": "EQUALS",
+                        "value": tag_name
+                    }
+                ]
+            }
+        }
+    }
+
+    status, response = qualys_api_request(gateway_url, endpoint, username, password, 'POST', search_data)
+
+    if status == 200 and response:
+        try:
+            data = response.get('ServiceResponse', {}).get('data', [])
+            if data:
+                for item in data:
+                    tag = item.get('Tag', {})
+                    tag_uuid = tag.get('id')
+                    tag_parent_id = tag.get('parentTagId')
+
+                    if not tag_uuid:
+                        continue
+
+                    # If parent specified, only match if parent matches
+                    if parent_tag_id:
+                        if str(tag_parent_id) == str(parent_tag_id):
+                            _qualys_tag_cache[cache_key] = str(tag_uuid)
+                            return str(tag_uuid)
+                    else:
+                        # No parent specified - return first match (for root-level tags)
+                        if not tag_parent_id:
+                            _qualys_tag_cache[cache_key] = str(tag_uuid)
+                            return str(tag_uuid)
+
+        except (KeyError, IndexError, TypeError) as e:
+            logger.error(f"Error parsing tag search response: {e}")
+
+    return None
+
+
+def create_tag(
+    gateway_url: str,
+    username: str,
+    password: str,
+    tag_name: str,
+    parent_tag_id: Optional[str] = None
+) -> Optional[str]:
+    """Create a new tag in Qualys.
+
+    Returns:
+        New tag UUID or None on failure
+    """
+    # Validate tag name
+    if not validate_qualys_tag_name(tag_name):
+        logger.error(f"Invalid tag name: {tag_name}")
+        return None
+
+    endpoint = "/qps/rest/2.0/create/am/tag"
+
+    tag_data = {
+        "ServiceRequest": {
+            "data": {
+                "Tag": {
+                    "name": tag_name
+                }
+            }
+        }
+    }
+
+    if parent_tag_id:
+        tag_data["ServiceRequest"]["data"]["Tag"]["parentTagId"] = parent_tag_id
+
+    status, response = qualys_api_request(gateway_url, endpoint, username, password, 'POST', tag_data)
+
+    if status in (200, 201) and response:
+        try:
+            tag_uuid = response.get('ServiceResponse', {}).get('data', [{}])[0].get('Tag', {}).get('id')
+            if tag_uuid:
+                # Cache with parent context for uniqueness
+                cache_key = f"tag:{parent_tag_id or 'root'}:{tag_name}"
+                _qualys_tag_cache[cache_key] = str(tag_uuid)
+                logger.info(f"Created Qualys tag: {tag_name} (parent={parent_tag_id}) -> {tag_uuid}")
+                return str(tag_uuid)
+        except (KeyError, IndexError, TypeError) as e:
+            logger.error(f"Error parsing tag create response: {e}")
+    else:
+        logger.error(f"Failed to create tag '{tag_name}': status={status}")
+
+    return None
+
+
+def get_or_create_tag(
+    gateway_url: str,
+    username: str,
+    password: str,
+    tag_name: str,
+    parent_tag_id: Optional[str] = None
+) -> Optional[str]:
+    """Get existing tag or create new one.
+
+    Returns:
+        Tag UUID or None on failure
+    """
+    # Try to find existing tag with parent context
+    tag_uuid = search_tag_by_name(gateway_url, username, password, tag_name, parent_tag_id)
+    if tag_uuid:
+        return tag_uuid
+
+    # Create new tag
+    return create_tag(gateway_url, username, password, tag_name, parent_tag_id)
+
+
+def ensure_tag_hierarchy(
+    gateway_url: str,
+    username: str,
+    password: str,
+    function_arn: str
+) -> Optional[str]:
+    """Ensure the Lambda -> Region -> ARN tag hierarchy exists.
+
+    Tag structure:
+        Lambda (parent)
+        └── <region> (child)
+            └── <full_arn> (child)
+
+    Returns:
+        The ARN tag UUID or None on failure
+    """
+    # Parse the ARN
+    # arn:aws:lambda:<region>:<account_id>:function:<function_name>
+    arn_parts = function_arn.split(':')
+    if len(arn_parts) < 7:
+        logger.error(f"Invalid function ARN format: {function_arn}")
+        return None
+
+    region = arn_parts[3]
+
+    # Use full ARN as tag name (Qualys supports up to 1024 chars)
+    arn_tag_name = function_arn
+
+    # Get or create parent "Lambda" tag
+    lambda_tag_id = get_or_create_tag(gateway_url, username, password, "Lambda")
+    if not lambda_tag_id:
+        logger.error("Failed to get/create Lambda parent tag")
+        return None
+
+    # Get or create region tag under Lambda
+    region_tag_id = get_or_create_tag(gateway_url, username, password, region, lambda_tag_id)
+    if not region_tag_id:
+        logger.error(f"Failed to get/create region tag: {region}")
+        return None
+
+    # Get or create ARN tag under region
+    arn_tag_id = get_or_create_tag(gateway_url, username, password, arn_tag_name, region_tag_id)
+    if not arn_tag_id:
+        logger.error(f"Failed to get/create ARN tag: {arn_tag_name}")
+        return None
+
+    return arn_tag_id
+
+
+def assign_tag_to_image(
+    gateway_url: str,
+    username: str,
+    password: str,
+    image_uuid: str,
+    tag_uuid: str
+) -> bool:
+    """Assign a tag to an image in Qualys CS.
+
+    Returns:
+        True on success, False on failure
+    """
+    endpoint = "/csapi/v1.3/tags/assign"
+
+    assign_data = {
+        "entityUUID": image_uuid,
+        "tagsToAdd": [
+            {"tagUuid": tag_uuid}
+        ],
+        "entityType": "IMAGE",
+        "moduleCode": "CS"
+    }
+
+    status, response = qualys_api_request(gateway_url, endpoint, username, password, 'POST', assign_data)
+
+    if status in (200, 201, 204):
+        logger.info(f"Successfully assigned tag {tag_uuid} to image {image_uuid}")
+        return True
+    else:
+        logger.error(f"Failed to assign tag to image: status={status}")
+        return False
+
+
+def tag_qualys_image(qualys_creds: Dict[str, str], function_arn: str, image_sha: str) -> bool:
+    """Tag a scanned image in Qualys CS with Lambda function information.
+
+    This creates/uses the tag hierarchy: Lambda -> <region> -> <full_arn>
+
+    Returns:
+        True on success, False on failure
+    """
+    if not ENABLE_QUALYS_TAGGING:
+        return True
+
+    # Check for required credentials
+    username = qualys_creds.get('qualys_api_username')
+    password = qualys_creds.get('qualys_api_password')
+    pod = qualys_creds.get('qualys_pod')
+
+    if not username or not password:
+        logger.warning("Qualys API credentials not configured, skipping image tagging")
+        return False
+
+    if not pod:
+        logger.error("Qualys pod not configured")
+        return False
+
+    gateway_url = get_qualys_gateway_url(pod)
+
+    try:
+        # Get image UUID from Qualys
+        image_data = get_image_by_sha(gateway_url, username, password, image_sha)
+        if not image_data:
+            logger.warning(f"Image not found in Qualys, cannot tag: {image_sha}")
+            return False
+
+        image_uuid = image_data.get('uuid')
+        if not image_uuid:
+            logger.error("Image response missing 'uuid' field")
+            return False
+
+        # Ensure tag hierarchy exists and get ARN tag UUID
+        arn_tag_uuid = ensure_tag_hierarchy(gateway_url, username, password, function_arn)
+        if not arn_tag_uuid:
+            logger.error("Failed to create tag hierarchy")
+            return False
+
+        # Assign tag to image
+        return assign_tag_to_image(gateway_url, username, password, image_uuid, arn_tag_uuid)
+
+    except Exception as e:
+        logger.error(f"Error tagging Qualys image: {e}")
+        return False
 
 
 def publish_custom_metrics(metric_data: Dict[str, Any]) -> None:
@@ -516,6 +951,54 @@ def extract_repo_tags(scan_results: Dict[str, Any], scan_timestamp: str) -> Opti
         return None
 
 
+def extract_image_sha(scan_results: Dict[str, Any]) -> Optional[str]:
+    """Extract image SHA256 from Metadata.TargetMetadata.ImageMetadata in scan results JSON.
+
+    Returns:
+        Image SHA256 (with or without 'sha256:' prefix) or None if not found
+    """
+    try:
+        if 'results' not in scan_results or not isinstance(scan_results['results'], dict):
+            return None
+
+        results = scan_results['results']
+
+        if 'Metadata' not in results or not isinstance(results['Metadata'], dict):
+            return None
+
+        metadata = results['Metadata']
+        if 'TargetMetadata' not in metadata or not isinstance(metadata['TargetMetadata'], dict):
+            return None
+
+        target_metadata = metadata['TargetMetadata']
+        if 'ImageMetadata' not in target_metadata or not isinstance(target_metadata['ImageMetadata'], dict):
+            return None
+
+        image_metadata = target_metadata['ImageMetadata']
+
+        # Try ImageId first (full SHA256)
+        image_id = image_metadata.get('ImageId')
+        if image_id and isinstance(image_id, str) and len(image_id) >= 64:
+            logger.info(f"Found image SHA from ImageId: {image_id[:16]}...")
+            return image_id
+
+        # Try RepoDigests as fallback
+        repo_digests = image_metadata.get('RepoDigests', [])
+        if repo_digests and isinstance(repo_digests, list) and len(repo_digests) > 0:
+            # Format: registry/repo@sha256:abcd...
+            digest = repo_digests[0]
+            if '@sha256:' in digest:
+                sha = digest.split('@sha256:')[1]
+                logger.info(f"Found image SHA from RepoDigests: {sha[:16]}...")
+                return sha
+
+        return None
+
+    except Exception as e:
+        logger.error(f"Error extracting image SHA: {e}")
+        return None
+
+
 def tag_lambda_function(function_arn: str, repo_tag: Optional[str], scan_timestamp: str, scan_success: bool) -> None:
     """Tag Lambda function with scan results"""
     try:
@@ -688,6 +1171,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         update_scan_cache(function_arn, lambda_details, scan_results)
         store_results(lambda_details, scan_results)
+
+        # Tag image in Qualys CS (if enabled and scan succeeded)
+        if ENABLE_QUALYS_TAGGING and scan_results.get('success'):
+            image_sha = extract_image_sha(scan_results)
+            if image_sha:
+                tag_qualys_image(qualys_creds, function_arn, image_sha)
+            else:
+                logger.warning("Could not extract image SHA for Qualys tagging")
 
         # Extract vulnerability count if available
         vuln_count = 0

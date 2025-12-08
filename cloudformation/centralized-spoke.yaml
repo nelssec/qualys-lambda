@@ -44,20 +44,27 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # Lambda Read Permissions - scoped to account
+              # Lambda List - for bulk scan (all regions, scoped to account)
+              - Sid: LambdaList
+                Effect: Allow
+                Action:
+                  - lambda:ListFunctions
+                Resource: '*'
+
+              # Lambda Read Permissions - all regions, scoped to account
               - Sid: LambdaRead
                 Effect: Allow
                 Action:
                   - lambda:GetFunction
                   - lambda:GetFunctionConfiguration
-                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+                Resource: !Sub 'arn:aws:lambda:*:${AWS::AccountId}:function:*'
 
-              # Lambda Tag Permission with tag key restriction
+              # Lambda Tag Permission with tag key restriction - all regions
               - Sid: LambdaTag
                 Effect: Allow
                 Action:
                   - lambda:TagResource
-                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+                Resource: !Sub 'arn:aws:lambda:*:${AWS::AccountId}:function:*'
                 Condition:
                   'ForAllValues:StringLike':
                     'aws:TagKeys':
@@ -70,7 +77,7 @@ Resources:
                   - ecr:GetAuthorizationToken
                 Resource: '*'
 
-              # ECR Repository Access - scoped to account
+              # ECR Repository Access - all regions, scoped to account
               - Sid: ECRRepositoryAccess
                 Effect: Allow
                 Action:
@@ -78,7 +85,7 @@ Resources:
                   - ecr:GetDownloadUrlForLayer
                   - ecr:BatchGetImage
                   - ecr:DescribeImages
-                Resource: !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+                Resource: !Sub 'arn:aws:ecr:*:${AWS::AccountId}:repository/*'
 
       Tags:
         - Key: Name

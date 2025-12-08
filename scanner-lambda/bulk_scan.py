@@ -1,18 +1,19 @@
 """
-Bulk Scan Lambda - Scans all existing Lambda functions in an account.
+Bulk Scan Lambda - Scans all existing Lambda functions across accounts and regions.
 
 This function is triggered manually or on a schedule to scan existing functions
 that weren't caught by the event-driven scanner (CreateFunction/UpdateFunction events).
 
 Architecture:
 - Directly invokes the scanner Lambda asynchronously for each function
+- Supports multi-region scanning within each account
 - Uses the existing DynamoDB cache to skip already-scanned functions
-- No additional SQS queue needed - keeps costs minimal
 
 Usage:
 - Invoke manually to scan all functions in an account
 - Schedule via EventBridge for periodic full scans (e.g., weekly)
 - Pass account_ids list to scan across multiple accounts (centralized mode)
+- Pass regions list to scan specific regions (defaults to current region)
 
 Environment Variables:
 - SCANNER_FUNCTION_NAME: Name of the scanner Lambda to invoke
@@ -22,6 +23,7 @@ Environment Variables:
 - INVOCATION_DELAY_MS: Delay between batches in ms (default: 100)
 - MAX_WORKERS: Number of parallel invocation threads (default: 10)
 - BATCH_SIZE: Functions per batch before pause (default: 100)
+- DEFAULT_REGIONS: Comma-separated list of regions to scan (optional)
 """
 
 import boto3
@@ -46,16 +48,24 @@ CROSS_ACCOUNT_ROLE_NAME = os.environ.get('CROSS_ACCOUNT_ROLE_NAME', '')
 SCANNER_EXTERNAL_ID = os.environ.get('SCANNER_EXTERNAL_ID', '')
 EXCLUDE_PATTERNS = os.environ.get('EXCLUDE_PATTERNS', 'qualys-lambda-scanner,bulk-scan').split(',')
 INVOCATION_DELAY_MS = int(os.environ.get('INVOCATION_DELAY_MS', '100'))
-MAX_WORKERS = int(os.environ.get('MAX_WORKERS', '10'))  # Parallel invocation threads
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '100'))  # Functions per batch before pause
+MAX_WORKERS = int(os.environ.get('MAX_WORKERS', '10'))
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '100'))
+CURRENT_REGION = os.environ.get('AWS_REGION', 'us-east-1')
+DEFAULT_REGIONS = [r.strip() for r in os.environ.get('DEFAULT_REGIONS', '').split(',') if r.strip()]
 
 # Validation patterns
 ACCOUNT_ID_PATTERN = re.compile(r'^\d{12}$')
+REGION_PATTERN = re.compile(r'^[a-z]{2}-[a-z]+-\d+$')
 
 
 def validate_account_id(account_id: str) -> bool:
     """Validate AWS account ID format."""
     return bool(ACCOUNT_ID_PATTERN.match(account_id))
+
+
+def validate_region(region: str) -> bool:
+    """Validate AWS region format."""
+    return bool(REGION_PATTERN.match(region))
 
 
 def should_exclude(function_name: str, exclude_patterns: list) -> bool:
@@ -67,13 +77,30 @@ def should_exclude(function_name: str, exclude_patterns: list) -> bool:
     return False
 
 
-def get_lambda_client_for_account(account_id: str) -> Optional[boto3.client]:
-    """Get Lambda client for a specific account (cross-account)."""
+def get_lambda_client_for_region(region: str) -> Optional[boto3.client]:
+    """Get Lambda client for a specific region in current account."""
+    if not validate_region(region):
+        logger.error(f"Invalid region format: {region}")
+        return None
+
+    try:
+        return boto3.client('lambda', region_name=region)
+    except Exception as e:
+        logger.error(f"Failed to create Lambda client for region {region}: {e}")
+        return None
+
+
+def get_lambda_client_for_account(account_id: str, region: str = None) -> Optional[boto3.client]:
+    """Get Lambda client for a specific account and region (cross-account)."""
     if not CROSS_ACCOUNT_ROLE_NAME:
         return None
 
     if not validate_account_id(account_id):
         logger.error(f"Invalid account ID format: {account_id}")
+        return None
+
+    if region and not validate_region(region):
+        logger.error(f"Invalid region format: {region}")
         return None
 
     try:
@@ -85,12 +112,15 @@ def get_lambda_client_for_account(account_id: str) -> Optional[boto3.client]:
             ExternalId=SCANNER_EXTERNAL_ID
         )
 
-        return boto3.client(
-            'lambda',
-            aws_access_key_id=assumed_role['Credentials']['AccessKeyId'],
-            aws_secret_access_key=assumed_role['Credentials']['SecretAccessKey'],
-            aws_session_token=assumed_role['Credentials']['SessionToken']
-        )
+        client_kwargs = {
+            'aws_access_key_id': assumed_role['Credentials']['AccessKeyId'],
+            'aws_secret_access_key': assumed_role['Credentials']['SecretAccessKey'],
+            'aws_session_token': assumed_role['Credentials']['SessionToken']
+        }
+        if region:
+            client_kwargs['region_name'] = region
+
+        return boto3.client('lambda', **client_kwargs)
     except Exception as e:
         logger.error(f"Failed to assume role in account {account_id}: {e}")
         return None
@@ -200,6 +230,83 @@ def invoke_batch_parallel(functions: List[Dict[str, Any]], account_id: str) -> T
     return invoked, failed
 
 
+def process_region(account_id: str, region: str, current_account: str,
+                    exclude_patterns: list, dry_run: bool) -> Dict[str, Any]:
+    """Process a single account/region combination.
+
+    Returns:
+        Dict with region results including functions, invoked, failed counts
+    """
+    result = {
+        'region': region,
+        'status': 'pending',
+        'functions': 0,
+        'invoked': 0,
+        'failed': 0
+    }
+
+    try:
+        # Get appropriate Lambda client for this account/region
+        if account_id == current_account:
+            if region == CURRENT_REGION:
+                list_client = lambda_client
+            else:
+                list_client = get_lambda_client_for_region(region)
+        else:
+            list_client = get_lambda_client_for_account(account_id, region)
+
+        if not list_client:
+            result['status'] = 'failed'
+            result['error'] = 'Could not create Lambda client'
+            return result
+
+        # List all functions in this region
+        functions = list_all_functions(list_client, exclude_patterns)
+        function_count = len(functions)
+        result['functions'] = function_count
+
+        logger.info(f"Found {function_count} functions in {account_id}/{region}")
+
+        if dry_run:
+            result['status'] = 'dry_run'
+            return result
+
+        if function_count == 0:
+            result['status'] = 'success'
+            return result
+
+        # Invoke scanner in parallel batches
+        invoked = 0
+        failed = 0
+
+        for i in range(0, len(functions), BATCH_SIZE):
+            batch = functions[i:i + BATCH_SIZE]
+            batch_num = (i // BATCH_SIZE) + 1
+            total_batches = (len(functions) + BATCH_SIZE - 1) // BATCH_SIZE
+
+            logger.info(f"Processing batch {batch_num}/{total_batches} in {region} ({len(batch)} functions)")
+
+            batch_invoked, batch_failed = invoke_batch_parallel(batch, account_id)
+            invoked += batch_invoked
+            failed += batch_failed
+
+            # Pause between batches to avoid throttling
+            if i + BATCH_SIZE < len(functions) and INVOCATION_DELAY_MS > 0:
+                pause_seconds = (INVOCATION_DELAY_MS * BATCH_SIZE) / 1000.0
+                time.sleep(pause_seconds)
+
+        result['invoked'] = invoked
+        result['failed'] = failed
+        result['status'] = 'success'
+
+    except Exception as e:
+        logger.error(f"Error processing {account_id}/{region}: {e}")
+        result['status'] = 'error'
+        result['error'] = str(e)
+
+    return result
+
+
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """
     Bulk scan handler.
@@ -207,9 +314,15 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     Event format:
     {
         "account_ids": ["123456789012", "234567890123"],  # Optional: cross-account
+        "regions": ["us-east-1", "us-west-2"],  # Optional: regions to scan
         "dry_run": false,  # Optional: just count, don't invoke scanner
         "exclude_patterns": ["test-", "dev-"]  # Optional: additional excludes
     }
+
+    Region behavior:
+    - If regions specified in event, use those
+    - Else if DEFAULT_REGIONS env var set, use those
+    - Else scan only current region
     """
     logger.info(f"Bulk scan triggered with event: {json.dumps(event)}")
 
@@ -222,8 +335,25 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
 
     # Parse event
     account_ids = event.get('account_ids', [])
+    event_regions = event.get('regions', [])
     dry_run = event.get('dry_run', False)
     additional_excludes = event.get('exclude_patterns', [])
+
+    # Determine regions to scan
+    if event_regions:
+        regions = [r.strip() for r in event_regions if r.strip()]
+    elif DEFAULT_REGIONS:
+        regions = DEFAULT_REGIONS
+    else:
+        regions = [CURRENT_REGION]
+
+    # Validate regions
+    invalid_regions = [r for r in regions if not validate_region(r)]
+    if invalid_regions:
+        return {
+            'statusCode': 400,
+            'body': {'error': f'Invalid regions: {invalid_regions}'}
+        }
 
     # Create local exclude patterns list (avoid modifying global for thread safety)
     exclude_patterns = list(EXCLUDE_PATTERNS) + additional_excludes
@@ -231,10 +361,10 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     results = {
         'accounts_processed': 0,
         'accounts_failed': 0,
+        'regions_scanned': len(regions),
         'total_functions': 0,
         'invoked': 0,
         'failed': 0,
-        'excluded': 0,
         'details': []
     }
 
@@ -244,6 +374,8 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     # If no account IDs specified, scan current account
     if not account_ids:
         account_ids = [current_account]
+
+    logger.info(f"Scanning {len(account_ids)} account(s) across {len(regions)} region(s): {regions}")
 
     for account_id in account_ids:
         account_id = str(account_id).strip()
@@ -255,78 +387,42 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
 
         logger.info(f"Processing account: {account_id}")
 
-        try:
-            # Get appropriate Lambda client for listing
-            if account_id == current_account:
-                list_client = lambda_client
-            else:
-                list_client = get_lambda_client_for_account(account_id)
-                if not list_client:
-                    results['accounts_failed'] += 1
-                    results['details'].append({
-                        'account': account_id,
-                        'status': 'failed',
-                        'error': 'Could not assume role'
-                    })
-                    continue
+        account_detail = {
+            'account': account_id,
+            'status': 'success',
+            'regions': [],
+            'total_functions': 0,
+            'total_invoked': 0,
+            'total_failed': 0
+        }
 
-            # List all functions
-            functions = list_all_functions(list_client, exclude_patterns)
-            function_count = len(functions)
-            results['total_functions'] += function_count
+        account_has_error = False
 
-            logger.info(f"Found {function_count} functions in account {account_id}")
+        for region in regions:
+            logger.info(f"Processing region: {region}")
 
-            if dry_run:
-                results['details'].append({
-                    'account': account_id,
-                    'status': 'dry_run',
-                    'functions': function_count
-                })
-            else:
-                # Invoke scanner in parallel batches for performance at scale
-                invoked = 0
-                failed = 0
+            region_result = process_region(
+                account_id, region, current_account,
+                exclude_patterns, dry_run
+            )
 
-                # Process in batches to avoid overwhelming Lambda service
-                for i in range(0, len(functions), BATCH_SIZE):
-                    batch = functions[i:i + BATCH_SIZE]
-                    batch_num = (i // BATCH_SIZE) + 1
-                    total_batches = (len(functions) + BATCH_SIZE - 1) // BATCH_SIZE
+            account_detail['regions'].append(region_result)
+            account_detail['total_functions'] += region_result.get('functions', 0)
+            account_detail['total_invoked'] += region_result.get('invoked', 0)
+            account_detail['total_failed'] += region_result.get('failed', 0)
 
-                    logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} functions)")
+            results['total_functions'] += region_result.get('functions', 0)
+            results['invoked'] += region_result.get('invoked', 0)
+            results['failed'] += region_result.get('failed', 0)
 
-                    batch_invoked, batch_failed = invoke_batch_parallel(batch, account_id)
-                    invoked += batch_invoked
-                    failed += batch_failed
+            if region_result.get('status') == 'error':
+                account_has_error = True
 
-                    # Pause between batches to avoid throttling
-                    if i + BATCH_SIZE < len(functions) and INVOCATION_DELAY_MS > 0:
-                        pause_seconds = (INVOCATION_DELAY_MS * BATCH_SIZE) / 1000.0
-                        logger.info(f"Pausing {pause_seconds:.1f}s between batches")
-                        time.sleep(pause_seconds)
+        if account_has_error:
+            account_detail['status'] = 'partial'
 
-                results['invoked'] += invoked
-                results['failed'] += failed
-
-                results['details'].append({
-                    'account': account_id,
-                    'status': 'success',
-                    'functions': function_count,
-                    'invoked': invoked,
-                    'failed': failed
-                })
-
-            results['accounts_processed'] += 1
-
-        except Exception as e:
-            logger.error(f"Error processing account {account_id}: {e}")
-            results['accounts_failed'] += 1
-            results['details'].append({
-                'account': account_id,
-                'status': 'error',
-                'error': str(e)
-            })
+        results['details'].append(account_detail)
+        results['accounts_processed'] += 1
 
     logger.info(f"Bulk scan complete: {json.dumps(results)}")
 

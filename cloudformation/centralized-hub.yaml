@@ -27,6 +27,26 @@ Parameters:
     Description: 'Qualys Access Token (will be stored in Secrets Manager)'
     NoEcho: true
 
+  QualysApiUsername:
+    Type: String
+    Description: 'Qualys API Username for CS API calls (optional, for image tagging)'
+    Default: ''
+    NoEcho: true
+
+  QualysApiPassword:
+    Type: String
+    Description: 'Qualys API Password for CS API calls (optional, for image tagging)'
+    Default: ''
+    NoEcho: true
+
+  EnableQualysTagging:
+    Type: String
+    Description: 'Enable Qualys Container Security tagging to link images to Lambda ARNs'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
   ArtifactsBucket:
     Type: String
     Description: 'S3 bucket containing Lambda code and layer artifacts'
@@ -127,6 +147,11 @@ Parameters:
     Type: String
     Description: 'S3 key for bulk scan Lambda code zip'
     Default: 'qualys-lambda-scanner/bulk-scan.zip'
+
+  BulkScanDefaultRegions:
+    Type: String
+    Description: 'Comma-separated list of regions for bulk scan (empty = current region only)'
+    Default: ''
 
   ScannerExternalId:
     Type: String
@@ -233,7 +258,9 @@ Resources:
       SecretString: !Sub |
         {
           "qualys_pod": "${QualysPod}",
-          "qualys_access_token": "${QualysAccessToken}"
+          "qualys_access_token": "${QualysAccessToken}",
+          "qualys_api_username": "${QualysApiUsername}",
+          "qualys_api_password": "${QualysApiPassword}"
         }
       Tags:
         - Key: Name
@@ -354,7 +381,7 @@ Resources:
                   - ecr:GetAuthorizationToken
                 Resource: '*'
 
-              # ECR Repository Access - scoped to account
+              # ECR Repository Access - all regions, scoped to account
               - Sid: ECRRepositoryAccess
                 Effect: Allow
                 Action:
@@ -362,22 +389,22 @@ Resources:
                   - ecr:GetDownloadUrlForLayer
                   - ecr:BatchGetImage
                   - ecr:DescribeImages
-                Resource: !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*'
+                Resource: !Sub 'arn:aws:ecr:*:${AWS::AccountId}:repository/*'
 
-              # Lambda Read Permissions (for own account)
+              # Lambda Read Permissions (for own account, all regions)
               - Sid: LambdaRead
                 Effect: Allow
                 Action:
                   - lambda:GetFunction
                   - lambda:GetFunctionConfiguration
-                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+                Resource: !Sub 'arn:aws:lambda:*:${AWS::AccountId}:function:*'
 
-              # Lambda Tag with restriction to QualysScan* tags only
+              # Lambda Tag with restriction to QualysScan* tags only (all regions)
               - Sid: LambdaTag
                 Effect: Allow
                 Action:
                   - lambda:TagResource
-                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+                Resource: !Sub 'arn:aws:lambda:*:${AWS::AccountId}:function:*'
                 Condition:
                   'ForAllValues:StringLike':
                     'aws:TagKeys':
@@ -528,6 +555,7 @@ Resources:
           CROSS_ACCOUNT_ROLE_NAME: 'qualys-lambda-scanner-spoke-role'
           SCANNER_EXTERNAL_ID: !Ref ScannerExternalId
           QSCANNER_PATH: '/opt/bin/qscanner'
+          ENABLE_QUALYS_TAGGING: !Ref EnableQualysTagging
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-scanner'
@@ -637,6 +665,7 @@ Resources:
           SCANNER_EXTERNAL_ID: !Ref ScannerExternalId
           EXCLUDE_PATTERNS: !Sub '${AWS::StackName}-scanner,${AWS::StackName}-bulk-scan'
           INVOCATION_DELAY_MS: '100'
+          DEFAULT_REGIONS: !Ref BulkScanDefaultRegions
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-bulk-scan'
