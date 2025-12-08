@@ -952,8 +952,19 @@ def _get_lambda_function(client, function_arn: str) -> Dict:
     return client.get_function(FunctionName=function_arn)
 
 
-def get_lambda_details(function_arn: str, cross_account_role: Optional[str] = None) -> Dict[str, Any]:
-    """Get Lambda function details, optionally assuming cross-account role."""
+def get_target_lambda_client(cross_account_role: Optional[str] = None) -> Any:
+    """Get Lambda client for target account.
+
+    For standalone mode (no cross-account role), returns the default Lambda client.
+    For hub-and-spoke mode (cross-account role provided), assumes the role and
+    returns a client with the assumed credentials.
+
+    Args:
+        cross_account_role: Optional IAM role ARN to assume for cross-account access
+
+    Returns:
+        boto3 Lambda client for the target account
+    """
     if cross_account_role:
         # Validate cross-account role ARN before attempting to assume it
         if not validate_role_arn(cross_account_role):
@@ -966,16 +977,29 @@ def get_lambda_details(function_arn: str, cross_account_role: Optional[str] = No
             SCANNER_EXTERNAL_ID
         )
 
-        lambda_client_temp = boto3.client(
+        return boto3.client(
             'lambda',
             aws_access_key_id=assumed_role['Credentials']['AccessKeyId'],
             aws_secret_access_key=assumed_role['Credentials']['SecretAccessKey'],
             aws_session_token=assumed_role['Credentials']['SessionToken']
         )
     else:
-        lambda_client_temp = lambda_client
+        return lambda_client
 
-    response = _get_lambda_function(lambda_client_temp, function_arn)
+
+def get_lambda_details(function_arn: str, target_lambda_client: Optional[Any] = None) -> Dict[str, Any]:
+    """Get Lambda function details using the provided Lambda client.
+
+    Args:
+        function_arn: ARN of the Lambda function
+        target_lambda_client: Lambda client to use. If not provided, uses the default client.
+
+    Returns:
+        Dictionary with Lambda function details
+    """
+    client = target_lambda_client if target_lambda_client else lambda_client
+
+    response = _get_lambda_function(client, function_arn)
     function_config = response['Configuration']
 
     logger.info(f"Retrieved details for Lambda: {function_config['FunctionName']}")
@@ -1206,8 +1230,25 @@ def extract_image_sha(scan_results: Dict[str, Any]) -> Optional[str]:
         return None
 
 
-def tag_lambda_function(function_arn: str, repo_tag: Optional[str], scan_timestamp: str, scan_success: bool, scan_partial: bool = False) -> None:
-    """Tag Lambda function with scan results"""
+def tag_lambda_function(
+    function_arn: str,
+    repo_tag: Optional[str],
+    scan_timestamp: str,
+    scan_success: bool,
+    scan_partial: bool = False,
+    target_lambda_client: Optional[Any] = None
+) -> None:
+    """Tag Lambda function with scan results.
+
+    Args:
+        function_arn: ARN of the Lambda function to tag
+        repo_tag: Optional repo tag from scan results
+        scan_timestamp: ISO timestamp of when scan occurred
+        scan_success: Whether the scan succeeded
+        scan_partial: Whether this was a partial success (SBOM uploaded but vuln report failed)
+        target_lambda_client: Optional Lambda client for cross-account tagging.
+                              If not provided, uses the default client (for same-account).
+    """
     try:
         if scan_success and scan_partial:
             status = 'partial'  # SBOM uploaded but vuln report failed
@@ -1231,7 +1272,9 @@ def tag_lambda_function(function_arn: str, repo_tag: Optional[str], scan_timesta
         else:
             logger.info("No RepoTag found, skipping QualysScanTag")
 
-        lambda_client.tag_resource(
+        # Use provided client for cross-account, or default for same-account
+        client = target_lambda_client if target_lambda_client else lambda_client
+        client.tag_resource(
             Resource=function_arn,
             Tags=tags
         )
@@ -1262,8 +1305,19 @@ def _sns_publish(topic_arn: str, subject: str, message: str) -> None:
     )
 
 
-def store_results(lambda_details: Dict[str, Any], scan_results: Dict[str, Any]) -> None:
-    """Store scan results to S3 and send SNS notification."""
+def store_results(
+    lambda_details: Dict[str, Any],
+    scan_results: Dict[str, Any],
+    target_lambda_client: Optional[Any] = None
+) -> None:
+    """Store scan results to S3 and send SNS notification.
+
+    Args:
+        lambda_details: Details about the scanned Lambda function
+        scan_results: Results from the QScanner scan
+        target_lambda_client: Optional Lambda client for cross-account tagging.
+                              If not provided, uses the default client (for same-account).
+    """
     timestamp = datetime.utcnow().isoformat()
 
     full_results = {
@@ -1313,7 +1367,8 @@ def store_results(lambda_details: Dict[str, Any], scan_results: Dict[str, Any]) 
         repo_tag,
         timestamp,
         scan_results['success'],
-        scan_results.get('partial', False)
+        scan_results.get('partial', False),
+        target_lambda_client
     )
 
 
@@ -1363,7 +1418,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         qualys_creds = get_qualys_credentials()
         cross_account_role = os.environ.get('CROSS_ACCOUNT_ROLE_ARN')
-        lambda_details = get_lambda_details(function_arn, cross_account_role)
+
+        # Get Lambda client for target account (handles both standalone and hub-and-spoke)
+        target_lambda_client = get_target_lambda_client(cross_account_role)
+        lambda_details = get_lambda_details(function_arn, target_lambda_client)
 
         code_sha256 = lambda_details.get('code_sha256')
         if code_sha256 and check_scan_cache(function_arn, code_sha256):
@@ -1390,7 +1448,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         scan_duration = time.time() - scan_start_time
 
         update_scan_cache(function_arn, lambda_details, scan_results)
-        store_results(lambda_details, scan_results)
+        store_results(lambda_details, scan_results, target_lambda_client)
 
         # Tag image in Qualys CS (if enabled and scan succeeded)
         if ENABLE_QUALYS_TAGGING and scan_results.get('success'):
