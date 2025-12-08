@@ -182,6 +182,43 @@ def get_qualys_api_url(pod: str) -> str:
     return QUALYS_API_MAP[pod_upper]
 
 
+def qualys_cs_api_request(
+    gateway_url: str,
+    endpoint: str,
+    token: str,
+    method: str = 'GET',
+    data: Optional[Dict] = None,
+    timeout: int = 30
+) -> Tuple[int, Optional[Dict]]:
+    """Make a request to the Qualys Container Security API with Bearer token auth."""
+    url = f"{gateway_url}{endpoint}"
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+    }
+
+    try:
+        body = json.dumps(data).encode('utf-8') if data else None
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = response.read().decode('utf-8')
+            if response_body:
+                return response.status, json.loads(response_body)
+            return response.status, None
+
+    except urllib.error.HTTPError as e:
+        logger.error(f"Qualys CS API HTTP error: {e.code} - {e.reason}")
+        return e.code, None
+    except urllib.error.URLError as e:
+        logger.error(f"Qualys CS API URL error: {e.reason}")
+        return 0, None
+    except Exception as e:
+        logger.error(f"Qualys CS API request failed: {e}")
+        return 0, None
+
+
 def qualys_api_request(
     gateway_url: str,
     endpoint: str,
@@ -267,27 +304,21 @@ def qualys_api_request(
     return last_status, None
 
 
-def get_image_by_sha(gateway_url: str, username: str, password: str, image_sha: str) -> Optional[Dict]:
-    """Get image details from Qualys CS by SHA256."""
+def get_image_by_sha(gateway_url: str, token: str, image_sha: str) -> Optional[Dict]:
+    """Get image details from Qualys CS by SHA256 using Bearer token auth."""
     # Remove 'sha256:' prefix if present
     if image_sha.startswith('sha256:'):
         image_sha = image_sha[7:]
 
     endpoint = f"/csapi/v1.3/images/{image_sha}"
-    status, response = qualys_api_request(gateway_url, endpoint, username, password)
+    status, response = qualys_cs_api_request(gateway_url, endpoint, token)
 
     if status == 200 and response:
         return response
-    elif status == 401:
-        logger.error("Qualys API authentication failed - check username/password")
-    elif status == 403:
-        logger.error("Qualys API access denied - check user permissions for Container Security")
     elif status == 404:
-        logger.warning(f"Image not found in Qualys (may not be scanned yet): {image_sha[:16]}...")
-    elif status == 0:
-        logger.error("Qualys API connection failed - check network/gateway URL")
-    else:
-        logger.error(f"Qualys API error: status={status}")
+        pass  # Not found is expected during retries
+    elif status != 0:
+        logger.error(f"Qualys CS API error: status={status}")
 
     return None
 
@@ -505,28 +536,22 @@ def ensure_tag_hierarchy(
 
 def assign_tag_to_image(
     gateway_url: str,
-    username: str,
-    password: str,
+    token: str,
     image_uuid: str,
     tag_uuid: str
 ) -> bool:
-    """Assign a tag to an image in Qualys CS.
-
-    Returns:
-        True on success, False on failure
-    """
-    endpoint = "/csapi/v1.3/tags/assign"
+    """Assign a tag to an image in Qualys CS using Bearer token auth."""
+    endpoint = "/csapi/v1.3/tag/assign"
 
     assign_data = {
         "entityUUID": image_uuid,
         "tagsToAdd": [
-            {"tagUuid": tag_uuid}
+            {"tagUuid": tag_uuid, "isCascadeToContainer": False}
         ],
-        "entityType": "IMAGE",
-        "moduleCode": "CS"
+        "entityType": "IMAGE"
     }
 
-    status, response = qualys_api_request(gateway_url, endpoint, username, password, 'POST', assign_data)
+    status, response = qualys_cs_api_request(gateway_url, endpoint, token, 'POST', assign_data)
 
     if status in (200, 201, 204):
         logger.info(f"Successfully assigned tag {tag_uuid} to image {image_uuid}")
@@ -548,33 +573,41 @@ def tag_qualys_image(qualys_creds: Dict[str, str], function_arn: str, image_sha:
         return True
 
     # Validate credentials
+    token = qualys_creds.get('qualys_access_token', '').strip()
     username = qualys_creds.get('qualys_api_username', '').strip()
     password = qualys_creds.get('qualys_api_password', '').strip()
     pod = qualys_creds.get('qualys_pod', '').strip()
 
     if not pod:
-        logger.error("Qualys tagging enabled but 'qualys_pod' missing from credentials")
+        logger.error("Qualys tagging: 'qualys_pod' missing from credentials")
         return False
 
-    if not username:
-        logger.error("Qualys tagging enabled but 'qualys_api_username' missing from credentials. "
-                     "Add username to Secrets Manager or disable tagging.")
+    if not token:
+        logger.error("Qualys tagging: 'qualys_access_token' missing from credentials")
         return False
 
-    if not password:
-        logger.error("Qualys tagging enabled but 'qualys_api_password' missing from credentials. "
-                     "Add password to Secrets Manager or disable tagging.")
+    if not username or not password:
+        logger.error("Qualys tagging: username/password missing for Asset Management API")
         return False
 
     gateway_url = get_qualys_gateway_url(pod)
     api_url = get_qualys_api_url(pod)
-    logger.info(f"Qualys tagging: CS gateway={gateway_url}, API={api_url} for pod {pod}")
+    logger.info(f"Qualys tagging: pod={pod}")
 
     try:
-        # Get image UUID from Qualys CS API
-        image_data = get_image_by_sha(gateway_url, username, password, image_sha)
+        # Get image UUID from Qualys CS API with retry for timing delays
+        image_data = None
+        delays = [5, 10, 15]
+        for attempt, delay in enumerate(delays):
+            image_data = get_image_by_sha(gateway_url, token, image_sha)
+            if image_data:
+                break
+            if attempt < len(delays) - 1:
+                logger.info(f"Image not yet available, retrying in {delay}s...")
+                time.sleep(delay)
+
         if not image_data:
-            logger.warning(f"Image not found in Qualys, cannot tag: {image_sha}")
+            logger.warning(f"Image not found in Qualys after retries: {image_sha}")
             return False
 
         image_uuid = image_data.get('uuid')
@@ -589,7 +622,7 @@ def tag_qualys_image(qualys_creds: Dict[str, str], function_arn: str, image_sha:
             return False
 
         # Assign tag to image using CS API
-        return assign_tag_to_image(gateway_url, username, password, image_uuid, arn_tag_uuid)
+        return assign_tag_to_image(gateway_url, token, image_uuid, arn_tag_uuid)
 
     except Exception as e:
         logger.error(f"Error tagging Qualys image: {e}")
@@ -1020,10 +1053,9 @@ def extract_image_sha(scan_results: Dict[str, Any]) -> Optional[str]:
 
         image_metadata = target_metadata['ImageMetadata']
 
-        # Try ImageId first (full SHA256)
-        image_id = image_metadata.get('ImageId')
+        image_id = image_metadata.get('ImageID')
         if image_id and isinstance(image_id, str) and len(image_id) >= 64:
-            logger.info(f"Found image SHA from ImageId: {image_id[:16]}...")
+            logger.info(f"Found image SHA from ImageID: {image_id[:16]}...")
             return image_id
 
         # Try RepoDigests as fallback
