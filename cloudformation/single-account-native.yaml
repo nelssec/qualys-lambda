@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Qualys Lambda Scanner - Single Account (Native Lambda, No Docker)'
+Description: 'Qualys Lambda Scanner - Single Account'
 
 Parameters:
   QualysPod:
@@ -93,7 +93,7 @@ Parameters:
   ScannerReservedConcurrency:
     Type: Number
     Description: 'Reserved concurrent executions for Scanner Lambda (prevents runaway invocations)'
-    Default: 10
+    Default: 5
     MinValue: 1
     MaxValue: 100
 

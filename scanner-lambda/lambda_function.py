@@ -645,6 +645,47 @@ def publish_custom_metrics(metric_data: Dict[str, Any]) -> None:
         logger.error(f"Failed to publish custom metrics: {e}")
 
 
+def aws_retry(max_retries: int = 5, initial_delay: float = 0.5, max_delay: float = 30):
+    """Decorator for retrying AWS API calls with exponential backoff and jitter."""
+    def decorator(func: Callable):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except ClientError as e:
+                    error_code = e.response.get('Error', {}).get('Code', '')
+                    retryable_codes = [
+                        'Throttling', 'ThrottlingException', 'RequestThrottled',
+                        'ProvisionedThroughputExceededException', 'ServiceUnavailable',
+                        'InternalError', 'InternalServiceError', 'RequestLimitExceeded',
+                        'TooManyRequestsException', 'TransactionConflictException'
+                    ]
+                    if error_code in retryable_codes and attempt < max_retries - 1:
+                        delay = min(initial_delay * (2 ** attempt), max_delay)
+                        delay = delay * (0.5 + random.random())
+                        logger.warning(f"AWS API {func.__name__} attempt {attempt + 1}/{max_retries} failed with {error_code}, retrying in {delay:.1f}s")
+                        time.sleep(delay)
+                        last_exception = e
+                    else:
+                        raise
+                except BotoCoreError as e:
+                    if attempt < max_retries - 1:
+                        delay = min(initial_delay * (2 ** attempt), max_delay)
+                        delay = delay * (0.5 + random.random())
+                        logger.warning(f"AWS API {func.__name__} attempt {attempt + 1}/{max_retries} failed with {type(e).__name__}, retrying in {delay:.1f}s")
+                        time.sleep(delay)
+                        last_exception = e
+                    else:
+                        raise
+            if last_exception:
+                raise last_exception
+            raise ScanException(f"Max retries exceeded for {func.__name__}")
+        return wrapper
+    return decorator
+
+
 @aws_retry(max_retries=5, initial_delay=0.5)
 def get_qualys_credentials() -> Dict[str, str]:
     """Retrieve Qualys credentials from Secrets Manager with retry."""
@@ -831,49 +872,6 @@ def retry_with_backoff(func, max_retries=5, initial_delay=1, max_delay=30, jitte
             else:
                 raise
     raise ScanException("Max retries exceeded")
-
-
-def aws_retry(max_retries: int = 5, initial_delay: float = 0.5, max_delay: float = 30):
-    """Decorator for retrying AWS API calls with exponential backoff and jitter."""
-    def decorator(func: Callable):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            last_exception = None
-            for attempt in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
-                except ClientError as e:
-                    error_code = e.response.get('Error', {}).get('Code', '')
-                    # Retryable error codes
-                    retryable_codes = [
-                        'Throttling', 'ThrottlingException', 'RequestThrottled',
-                        'ProvisionedThroughputExceededException', 'ServiceUnavailable',
-                        'InternalError', 'InternalServiceError', 'RequestLimitExceeded',
-                        'TooManyRequestsException', 'TransactionConflictException'
-                    ]
-                    if error_code in retryable_codes and attempt < max_retries - 1:
-                        delay = min(initial_delay * (2 ** attempt), max_delay)
-                        delay = delay * (0.5 + random.random())  # Add jitter
-                        logger.warning(f"AWS API {func.__name__} attempt {attempt + 1}/{max_retries} failed with {error_code}, retrying in {delay:.1f}s")
-                        time.sleep(delay)
-                        last_exception = e
-                    else:
-                        raise
-                except BotoCoreError as e:
-                    # Network-level errors
-                    if attempt < max_retries - 1:
-                        delay = min(initial_delay * (2 ** attempt), max_delay)
-                        delay = delay * (0.5 + random.random())
-                        logger.warning(f"AWS API {func.__name__} attempt {attempt + 1}/{max_retries} failed with {type(e).__name__}, retrying in {delay:.1f}s")
-                        time.sleep(delay)
-                        last_exception = e
-                    else:
-                        raise
-            if last_exception:
-                raise last_exception
-            raise ScanException(f"Max retries exceeded for {func.__name__}")
-        return wrapper
-    return decorator
 
 
 def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: str) -> Dict[str, Any]:

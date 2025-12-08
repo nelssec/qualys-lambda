@@ -104,9 +104,9 @@ Parameters:
 
   ScannerReservedConcurrency:
     Type: Number
-    Description: 'Reserved concurrent executions for Scanner Lambda (prevents runaway invocations)'
-    Default: 10
-    MinValue: 1
+    Description: 'Reserved concurrent executions for Scanner Lambda (0 = no reservation, use for low-quota accounts)'
+    Default: 0
+    MinValue: 0
     MaxValue: 100
 
   ScannerMemorySize:
@@ -169,6 +169,7 @@ Conditions:
   CreateBulkScanSchedule: !And
     - !Condition CreateBulkScan
     - !Not [!Equals [!Ref BulkScanSchedule, '']]
+  UseReservedConcurrency: !Not [!Equals [!Ref ScannerReservedConcurrency, 0]]
 
 Resources:
   # KMS key for encrypting sensitive data (DynamoDB, SQS, SNS, CloudWatch Logs)
@@ -533,8 +534,8 @@ Resources:
       Role: !GetAtt ScannerLambdaRole.Arn
       MemorySize: !Ref ScannerMemorySize
       Timeout: !Ref ScannerTimeout
-      # Reserved concurrency prevents runaway invocations during mass Lambda deployments
-      ReservedConcurrentExecutions: !Ref ScannerReservedConcurrency
+      # Reserved concurrency prevents runaway invocations (set to 0 for low-quota accounts)
+      ReservedConcurrentExecutions: !If [UseReservedConcurrency, !Ref ScannerReservedConcurrency, !Ref 'AWS::NoValue']
       EphemeralStorage:
         Size: !Ref ScannerEphemeralStorage
       Layers:

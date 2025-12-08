@@ -2,7 +2,7 @@
 
 # Variables
 AWS_REGION ?= us-east-1
-STACK_NAME ?= qscanner
+STACK_NAME ?= qualys-lambda-scanner
 QUALYS_POD ?= US2
 LAYER_NAME ?= qscanner
 S3_BUCKET ?= $(STACK_NAME)-artifacts-$(shell aws sts get-caller-identity --query Account --output text)
@@ -12,6 +12,9 @@ QUALYS_ACCESS_TOKEN ?= $(shell echo $$QUALYS_ACCESS_TOKEN)
 TAG ?= false
 USERNAME ?=
 PASSWORD ?=
+
+# Cross-account security
+EXTERNAL_ID ?= $(shell openssl rand -hex 16)
 
 # StackSet/Organization variables
 ORG_ID ?= $(shell aws organizations describe-organization --query 'Organization.Id' --output text 2>/dev/null)
@@ -314,6 +317,7 @@ deploy-hub: upload-artifacts
 			QualysAccessToken=$(QUALYS_ACCESS_TOKEN) \
 			ArtifactsBucket=$$BUCKET \
 			OrganizationId=$(ORG_ID) \
+			ScannerExternalId=$(EXTERNAL_ID) \
 			EnableQualysTagging=$(TAG) \
 			QualysApiUsername=$(USERNAME) \
 			QualysApiPassword=$(PASSWORD) \
