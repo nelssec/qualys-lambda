@@ -55,12 +55,13 @@ if not SCANNER_EXTERNAL_ID:
 ENABLE_QUALYS_TAGGING = os.environ.get('ENABLE_QUALYS_TAGGING', 'false').lower() == 'true'
 
 # Qualys Pod to Gateway URL mapping
+# Gateway URLs for Container Security API (csapi)
 QUALYS_GATEWAY_MAP = {
     'US1': 'https://gateway.qg1.apps.qualys.com',
     'US2': 'https://gateway.qg2.apps.qualys.com',
     'US3': 'https://gateway.qg3.apps.qualys.com',
     'US4': 'https://gateway.qg4.apps.qualys.com',
-    'GOV1': 'https://gateway.qg1.apps.qualys.com',  # GOV uses US infrastructure
+    'GOV1': 'https://gateway.qg1.apps.qualys.com',
     'EU1': 'https://gateway.qg1.apps.qualys.eu',
     'EU2': 'https://gateway.qg2.apps.qualys.eu',
     'EU3': 'https://gateway.qg3.apps.qualys.it',
@@ -70,6 +71,24 @@ QUALYS_GATEWAY_MAP = {
     'UK1': 'https://gateway.qg1.apps.qualys.co.uk',
     'AU1': 'https://gateway.qg1.apps.qualys.com.au',
     'KSA1': 'https://gateway.qg1.apps.qualysksa.com',
+}
+
+# API URLs for Asset Management Tagging API (qps)
+QUALYS_API_MAP = {
+    'US1': 'https://qualysapi.qg1.apps.qualys.com',
+    'US2': 'https://qualysapi.qg2.apps.qualys.com',
+    'US3': 'https://qualysapi.qg3.apps.qualys.com',
+    'US4': 'https://qualysapi.qg4.apps.qualys.com',
+    'GOV1': 'https://qualysapi.qg1.apps.qualys.com',
+    'EU1': 'https://qualysapi.qg1.apps.qualys.eu',
+    'EU2': 'https://qualysapi.qg2.apps.qualys.eu',
+    'EU3': 'https://qualysapi.qg3.apps.qualys.it',
+    'IN1': 'https://qualysapi.qg1.apps.qualys.in',
+    'CA1': 'https://qualysapi.qg1.apps.qualys.ca',
+    'AE1': 'https://qualysapi.qg1.apps.qualys.ae',
+    'UK1': 'https://qualysapi.qg1.apps.qualys.co.uk',
+    'AU1': 'https://qualysapi.qg1.apps.qualys.com.au',
+    'KSA1': 'https://qualysapi.qg1.apps.qualysksa.com',
 }
 
 # Tag cache to avoid repeated API lookups
@@ -146,12 +165,21 @@ def sanitize_log_output(output: str) -> str:
 # =============================================================================
 
 def get_qualys_gateway_url(pod: str) -> str:
-    """Get the Qualys gateway URL for a given pod."""
+    """Get the Qualys gateway URL for Container Security API."""
     pod_upper = pod.upper()
     if pod_upper not in QUALYS_GATEWAY_MAP:
         logger.warning(f"Unknown Qualys pod: {pod}, defaulting to US2")
         return QUALYS_GATEWAY_MAP['US2']
     return QUALYS_GATEWAY_MAP[pod_upper]
+
+
+def get_qualys_api_url(pod: str) -> str:
+    """Get the Qualys API URL for Asset Management/Tagging API."""
+    pod_upper = pod.upper()
+    if pod_upper not in QUALYS_API_MAP:
+        logger.warning(f"Unknown Qualys pod: {pod}, defaulting to US2")
+        return QUALYS_API_MAP['US2']
+    return QUALYS_API_MAP[pod_upper]
 
 
 def qualys_api_request(
@@ -539,10 +567,11 @@ def tag_qualys_image(qualys_creds: Dict[str, str], function_arn: str, image_sha:
         return False
 
     gateway_url = get_qualys_gateway_url(pod)
-    logger.info(f"Qualys tagging: using gateway {gateway_url} for pod {pod}")
+    api_url = get_qualys_api_url(pod)
+    logger.info(f"Qualys tagging: CS gateway={gateway_url}, API={api_url} for pod {pod}")
 
     try:
-        # Get image UUID from Qualys
+        # Get image UUID from Qualys CS API
         image_data = get_image_by_sha(gateway_url, username, password, image_sha)
         if not image_data:
             logger.warning(f"Image not found in Qualys, cannot tag: {image_sha}")
@@ -553,13 +582,13 @@ def tag_qualys_image(qualys_creds: Dict[str, str], function_arn: str, image_sha:
             logger.error("Image response missing 'uuid' field")
             return False
 
-        # Ensure tag hierarchy exists and get ARN tag UUID
-        arn_tag_uuid = ensure_tag_hierarchy(gateway_url, username, password, function_arn)
+        # Ensure tag hierarchy exists using Asset Management API
+        arn_tag_uuid = ensure_tag_hierarchy(api_url, username, password, function_arn)
         if not arn_tag_uuid:
             logger.error("Failed to create tag hierarchy")
             return False
 
-        # Assign tag to image
+        # Assign tag to image using CS API
         return assign_tag_to_image(gateway_url, username, password, image_uuid, arn_tag_uuid)
 
     except Exception as e:
