@@ -342,11 +342,24 @@ The event-driven scanner only processes new or updated Lambda functions. To scan
 
 ### Manual Invocation
 
+The bulk scan function name depends on your deployment type:
+- **StackSet deployment**: `qualys-lambda-bulk-scan`
+- **Single account**: `<stack-name>-bulk-scan` (e.g., `qualys-scanner-bulk-scan`)
+- **Hub deployment**: `<stack-name>-bulk-scan` (e.g., `qscanner-hub-bulk-scan`)
+
 Scan current account:
 
 ```bash
+# StackSet deployment
 aws lambda invoke \
   --function-name qualys-lambda-bulk-scan \
+  --payload '{}' \
+  --region us-east-1 \
+  output.json
+
+# Single account or Hub (replace with your stack name)
+aws lambda invoke \
+  --function-name <stack-name>-bulk-scan \
   --payload '{}' \
   --region us-east-1 \
   output.json
@@ -358,7 +371,7 @@ Scan specific accounts (centralized hub only):
 
 ```bash
 aws lambda invoke \
-  --function-name qscanner-hub-bulk-scan \
+  --function-name <stack-name>-bulk-scan \
   --payload '{"account_ids": ["111111111111", "222222222222"]}' \
   --region us-east-1 \
   output.json
@@ -368,7 +381,7 @@ Dry run (count functions without scanning):
 
 ```bash
 aws lambda invoke \
-  --function-name qualys-lambda-bulk-scan \
+  --function-name <function-name> \
   --payload '{"dry_run": true}' \
   --region us-east-1 \
   output.json
@@ -378,7 +391,7 @@ Exclude specific functions:
 
 ```bash
 aws lambda invoke \
-  --function-name qualys-lambda-bulk-scan \
+  --function-name <function-name> \
   --payload '{"exclude_patterns": ["test-", "dev-", "staging-"]}' \
   --region us-east-1 \
   output.json
@@ -390,7 +403,7 @@ Scan across multiple regions:
 
 ```bash
 aws lambda invoke \
-  --function-name qualys-lambda-bulk-scan \
+  --function-name <function-name> \
   --payload '{"regions": ["us-east-1", "us-west-2", "eu-west-1"]}' \
   --region us-east-1 \
   output.json
