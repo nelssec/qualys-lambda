@@ -390,22 +390,30 @@ def search_tag_by_name(
             if data:
                 for item in data:
                     tag = item.get('Tag', {})
-                    tag_uuid = tag.get('id')
+                    # Log all available tag fields for debugging
+                    logger.info(f"AM API tag fields: {list(tag.keys())}")
+
+                    # Prefer UUID format, fall back to id
+                    tag_uuid = tag.get('uuid') or tag.get('tagUuid') or tag.get('id')
+                    tag_id = tag.get('id')
                     tag_parent_id = tag.get('parentTagId')
 
-                    if not tag_uuid:
+                    if not tag_uuid and not tag_id:
                         continue
+
+                    # Use UUID if available, otherwise use id
+                    result_id = str(tag_uuid) if tag_uuid else str(tag_id)
 
                     # If parent specified, only match if parent matches
                     if parent_tag_id:
                         if str(tag_parent_id) == str(parent_tag_id):
-                            _qualys_tag_cache[cache_key] = str(tag_uuid)
-                            return str(tag_uuid)
+                            _qualys_tag_cache[cache_key] = result_id
+                            return result_id
                     else:
                         # No parent specified - return first match (for root-level tags)
                         if not tag_parent_id:
-                            _qualys_tag_cache[cache_key] = str(tag_uuid)
-                            return str(tag_uuid)
+                            _qualys_tag_cache[cache_key] = result_id
+                            return result_id
 
         except (KeyError, IndexError, TypeError) as e:
             logger.error(f"Error parsing tag search response: {e}")
@@ -449,14 +457,18 @@ def create_tag(
 
     if status in (200, 201) and response:
         try:
-            tag_uuid = response.get('ServiceResponse', {}).get('data', [{}])[0].get('Tag', {}).get('id')
+            tag = response.get('ServiceResponse', {}).get('data', [{}])[0].get('Tag', {})
+            # Log all available tag fields for debugging
+            logger.info(f"AM API create tag fields: {list(tag.keys())}")
+            # Prefer UUID format, fall back to id
+            tag_uuid = tag.get('uuid') or tag.get('tagUuid') or tag.get('id')
             if tag_uuid:
                 cache_key = f"tag:{parent_tag_id or 'root'}:{tag_name}"
                 _qualys_tag_cache[cache_key] = str(tag_uuid)
                 logger.info(f"Created Qualys tag: {tag_name} -> {tag_uuid}")
                 return str(tag_uuid)
             else:
-                logger.error(f"Tag created but no ID in response: {response}")
+                logger.error(f"Tag created but no ID/UUID in response: {response}")
         except (KeyError, IndexError, TypeError) as e:
             logger.error(f"Unexpected tag create response format: {e}")
     elif status == 401:
