@@ -18,7 +18,7 @@ from botocore.exceptions import ClientError, BotoCoreError
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Suppress noisy boto/botocore logs (e.g., "Found credentials in environment variables")
+# Suppress noisy boto/botocore logs
 logging.getLogger('botocore').setLevel(logging.WARNING)
 logging.getLogger('boto3').setLevel(logging.WARNING)
 
@@ -353,7 +353,7 @@ def validate_qualys_tag_name(tag_name: str) -> bool:
         return False
     if len(tag_name) > 1024:
         return False
-    # Allow alphanumeric, dash, underscore, dot, space, colon (for ARNs)
+    # Allow alphanumeric, dash, underscore, dot, space, colon
     if not re.match(r'^[a-zA-Z0-9\-_.: ]+$', tag_name):
         return False
     return True
@@ -376,7 +376,7 @@ def search_tag_by_name(
         - tag_id: integer ID for use as parentTagId
         - tag_uuid: UUID for use in CS API tag assignment
     """
-    # Check cache first (include parent in cache key for uniqueness)
+    # Check cache first
     cache_key = f"tag:{parent_tag_id or 'root'}:{tag_name}"
     if cache_key in _qualys_tag_cache:
         return _qualys_tag_cache[cache_key]
@@ -423,7 +423,7 @@ def search_tag_by_name(
                             _qualys_tag_cache[cache_key] = result
                             return result
                     else:
-                        # No parent specified - return first match (for root-level tags)
+                        # No parent specified - return first match
                         if not tag_parent_id:
                             result = (str(tag_id), str(tag_uuid) if tag_uuid else str(tag_id))
                             _qualys_tag_cache[cache_key] = result
@@ -606,7 +606,7 @@ def ensure_tag_hierarchy(
     # Use full ARN as tag name (Qualys supports up to 1024 chars)
     arn_tag_name = function_arn
 
-    # Step 1: Get or create parent "Lambda" tag (root level)
+    # Step 1: Get or create root Lambda tag
     logger.info("Step 1: Getting/creating root 'Lambda' tag...")
     lambda_tag_result = get_or_create_tag(gateway_url, username, password, "Lambda")
     if not lambda_tag_result:
@@ -615,7 +615,7 @@ def ensure_tag_hierarchy(
     lambda_tag_id, lambda_tag_uuid = lambda_tag_result
     logger.info(f"Lambda tag: id={lambda_tag_id}, uuid={lambda_tag_uuid}")
 
-    # Step 2: Get or create region tag under Lambda (use integer ID as parent)
+    # Step 2: Get or create region tag under Lambda
     logger.info(f"Step 2: Getting/creating region tag '{region}' under Lambda...")
     region_tag_result = get_or_create_tag(gateway_url, username, password, region, lambda_tag_id)
     if not region_tag_result:
@@ -624,7 +624,7 @@ def ensure_tag_hierarchy(
     region_tag_id, region_tag_uuid = region_tag_result
     logger.info(f"Region tag: id={region_tag_id}, uuid={region_tag_uuid}")
 
-    # Step 3: Get or create ARN tag under region (use integer ID as parent)
+    # Step 3: Get or create ARN tag under region
     logger.info(f"Step 3: Getting/creating ARN tag under region...")
     arn_tag_result = get_or_create_tag(gateway_url, username, password, arn_tag_name, region_tag_id)
     if not arn_tag_result:
@@ -758,7 +758,7 @@ def publish_custom_metrics(metric_data: Dict[str, Any]) -> None:
                 'Unit': 'Count'
             })
 
-        # Partial success metric (SBOM uploaded but vuln report failed)
+        # Partial success metric
         if 'scan_partial' in metric_data:
             metrics.append({
                 'MetricName': 'ScanPartialSuccess',
@@ -1079,8 +1079,8 @@ def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: st
 
     logger.info(f"Executing: {' '.join(cmd[:6])} [credentials hidden] lambda {function_arn}")
 
-    # Exit codes that indicate partial success (SBOM uploaded but vuln report failed)
-    # 40 = Vulnerability reporter failed (404 Not Found) - scan data was still uploaded
+    # Exit codes that indicate partial success
+    # 40 = Vulnerability reporter failed - scan data was still uploaded
     PARTIAL_SUCCESS_EXIT_CODES = {40}
 
     try:
@@ -1131,7 +1131,7 @@ def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: st
 
         is_partial = result.returncode in PARTIAL_SUCCESS_EXIT_CODES
         return {
-            'success': True,  # True for both full and partial success (SBOM uploaded)
+            'success': True,
             'partial': is_partial,  # True if vuln report failed but SBOM succeeded
             'exit_code': result.returncode,
             'results': scan_results,
@@ -1153,7 +1153,7 @@ def extract_repo_tags(scan_results: Dict[str, Any], scan_timestamp: str) -> Opti
 
         results = scan_results['results']
 
-        # Only check Metadata.TargetMetadata.ImageMetadata.RepoTags (QScanner output structure)
+        # Only check Metadata.TargetMetadata.ImageMetadata.RepoTags
         if 'Metadata' not in results or not isinstance(results['Metadata'], dict):
             logger.warning("No Metadata found in scan results")
             return None
@@ -1268,7 +1268,7 @@ def tag_lambda_function(
 
         # Only add QualysScanTag if repo_tag was found
         if repo_tag:
-            # Extract just the timestamp portion (strip "lambdascan:" prefix if present)
+            # Extract timestamp from tag
             scan_tag = repo_tag.split(':', 1)[1] if ':' in repo_tag else repo_tag
             safe_scan_tag = scan_tag[:100] if len(scan_tag) > 100 else scan_tag
             tags['QualysScanTag'] = safe_scan_tag
@@ -1423,7 +1423,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         qualys_creds = get_qualys_credentials()
         cross_account_role = os.environ.get('CROSS_ACCOUNT_ROLE_ARN')
 
-        # Get Lambda client for target account (handles both standalone and hub-and-spoke)
+        # Get Lambda client for target account
         target_lambda_client = get_target_lambda_client(cross_account_role)
         lambda_details = get_lambda_details(function_arn, target_lambda_client)
 
@@ -1454,7 +1454,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         update_scan_cache(function_arn, lambda_details, scan_results)
         store_results(lambda_details, scan_results, target_lambda_client)
 
-        # Tag image in Qualys CS (if enabled and scan succeeded)
+        # Tag image in Qualys CS if enabled
         if ENABLE_QUALYS_TAGGING and scan_results.get('success'):
             image_sha = extract_image_sha(scan_results)
             if image_sha:
