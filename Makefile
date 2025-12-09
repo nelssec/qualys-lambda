@@ -8,8 +8,9 @@ LAYER_NAME ?= qscanner
 S3_BUCKET ?= $(STACK_NAME)-artifacts-$(shell aws sts get-caller-identity --query Account --output text)
 QUALYS_ACCESS_TOKEN ?= $(shell echo $$QUALYS_ACCESS_TOKEN)
 
-# Qualys tagging variables (optional)
-TAG ?= false
+# Tagging variables (optional)
+TAG ?= true
+LAMBDA_TAG ?= true
 USERNAME ?=
 PASSWORD ?=
 
@@ -51,7 +52,8 @@ help:
 	@echo "  QUALYS_POD           - Qualys POD (default: US2)"
 	@echo "  QUALYS_ACCESS_TOKEN  - Qualys access token (required, or set env var)"
 	@echo "  ORG_UNIT_IDS         - Comma-separated OU IDs for StackSet deployment"
-	@echo "  TAG                  - Enable Qualys image tagging (true/false, default: false)"
+	@echo "  TAG                  - Enable Qualys image tagging (true/false, default: true)"
+	@echo "  LAMBDA_TAG           - Enable Lambda resource tagging (true/false, default: true)"
 	@echo "  USERNAME             - Qualys API username (required if TAG=true)"
 	@echo "  PASSWORD             - Qualys API password (required if TAG=true)"
 	@echo ""
@@ -166,6 +168,7 @@ deploy: publish-layer upload-function create-secret
 			LambdaCodeKey=scanner-function.zip \
 			BulkScanCodeKey=bulk-scan.zip \
 			EnableQualysTagging=$(TAG) \
+			EnableLambdaTagging=$(LAMBDA_TAG) \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--region $(AWS_REGION)
 	@echo "Deployment complete!"
@@ -259,6 +262,7 @@ deploy-stackset: upload-artifacts
 			ParameterKey=QualysAccessToken,ParameterValue=$(QUALYS_ACCESS_TOKEN) \
 			ParameterKey=ArtifactsBucket,ParameterValue=$$BUCKET \
 			ParameterKey=EnableQualysTagging,ParameterValue=$(TAG) \
+			ParameterKey=EnableLambdaTagging,ParameterValue=$(LAMBDA_TAG) \
 			ParameterKey=QualysApiUsername,ParameterValue=$(USERNAME) \
 			ParameterKey=QualysApiPassword,ParameterValue=$(PASSWORD) \
 		--capabilities CAPABILITY_NAMED_IAM \
@@ -273,6 +277,7 @@ deploy-stackset: upload-artifacts
 				ParameterKey=QualysAccessToken,ParameterValue=$(QUALYS_ACCESS_TOKEN) \
 				ParameterKey=ArtifactsBucket,ParameterValue=$$BUCKET \
 				ParameterKey=EnableQualysTagging,ParameterValue=$(TAG) \
+				ParameterKey=EnableLambdaTagging,ParameterValue=$(LAMBDA_TAG) \
 				ParameterKey=QualysApiUsername,ParameterValue=$(USERNAME) \
 				ParameterKey=QualysApiPassword,ParameterValue=$(PASSWORD) \
 			--capabilities CAPABILITY_NAMED_IAM \
@@ -337,6 +342,7 @@ deploy-hub: upload-artifacts
 			OrganizationId=$(ORG_ID) \
 			ScannerExternalId=$(EXTERNAL_ID) \
 			EnableQualysTagging=$(TAG) \
+			EnableLambdaTagging=$(LAMBDA_TAG) \
 			QualysApiUsername=$(USERNAME) \
 			QualysApiPassword=$(PASSWORD) \
 		--capabilities CAPABILITY_NAMED_IAM \

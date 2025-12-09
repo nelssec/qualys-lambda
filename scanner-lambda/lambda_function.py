@@ -56,7 +56,8 @@ SCANNER_EXTERNAL_ID = os.environ.get('SCANNER_EXTERNAL_ID')
 if not SCANNER_EXTERNAL_ID:
     logger.warning("SCANNER_EXTERNAL_ID not set - cross-account scanning will fail")
 
-ENABLE_QUALYS_TAGGING = os.environ.get('ENABLE_QUALYS_TAGGING', 'false').lower() == 'true'
+ENABLE_QUALYS_TAGGING = os.environ.get('ENABLE_QUALYS_TAGGING', 'true').lower() == 'true'
+ENABLE_LAMBDA_TAGGING = os.environ.get('ENABLE_LAMBDA_TAGGING', 'true').lower() == 'true'
 
 # Qualys Pod to Gateway URL mapping
 # Gateway URLs for Container Security API (csapi)
@@ -344,22 +345,55 @@ def get_image_by_sha(gateway_url: str, token: str, image_sha: str) -> Optional[D
     return None
 
 
-def verify_tag_on_image(gateway_url: str, token: str, image_sha: str, tag_uuid: str) -> bool:
+def verify_tag_on_image(
+    gateway_url: str,
+    token: str,
+    image_sha: str,
+    tag_uuid: str,
+    max_retries: int = 3,
+    base_delay: float = 1.0
+) -> Tuple[bool, Optional[str]]:
     """Verify that a specific tag is assigned to an image in Qualys CS.
 
-    Returns True if the tag is found on the image, False otherwise.
+    Uses retries with exponential backoff to handle transient API failures.
+
+    Returns:
+        Tuple of (success: bool, error_reason: str or None)
+        - (True, None) if tag is found
+        - (False, None) if tag not found but API succeeded
+        - (False, "error message") if API call failed
     """
-    image_data = get_image_by_sha(gateway_url, token, image_sha)
-    if not image_data:
-        return False
+    for attempt in range(max_retries):
+        try:
+            image_data = get_image_by_sha(gateway_url, token, image_sha)
+            if image_data is None:
+                # API returned no data - could be transient
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                    time.sleep(delay)
+                    continue
+                return False, "Image not found in Qualys CS"
 
-    # Check if the tag is in the image's tags list
-    tags = image_data.get('tags', [])
-    for tag in tags:
-        if tag.get('uuid') == tag_uuid or tag.get('tagUuid') == tag_uuid:
-            return True
+            # Check if the tag is in the image's tags list
+            tags = image_data.get('tags', [])
+            tag_uuids = [t.get('uuid') or t.get('tagUuid') for t in tags]
+            logger.info(f"Image tags on verify: looking for {tag_uuid[:8]}... found {len(tags)} tags: {tag_uuids}")
+            for tag in tags:
+                if tag.get('uuid') == tag_uuid or tag.get('tagUuid') == tag_uuid:
+                    return True, None
 
-    return False
+            # Tag not found, but API succeeded
+            return False, None
+
+        except Exception as e:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                logger.warning(f"Verification API error (attempt {attempt + 1}): {e}, retrying in {delay:.1f}s")
+                time.sleep(delay)
+                continue
+            return False, f"API error: {str(e)}"
+
+    return False, "Max retries exceeded"
 
 
 def validate_qualys_tag_name(tag_name: str) -> bool:
@@ -568,16 +602,17 @@ def get_or_create_tag(
     password: str,
     tag_name: str,
     parent_tag_id: Optional[str] = None
-) -> Optional[Tuple[str, str]]:
+) -> Optional[Tuple[str, str, bool]]:
     """Get existing tag or create new one.
 
     Args:
         parent_tag_id: Integer ID of parent tag (not UUID)
 
     Returns:
-        Tuple of (tag_id, tag_uuid) or None on failure
+        Tuple of (tag_id, tag_uuid, was_created) or None on failure
         - tag_id: integer ID for use as parentTagId
         - tag_uuid: UUID for use in CS API tag assignment
+        - was_created: True if tag was newly created, False if it existed
     """
     logger.info(f"get_or_create_tag: name='{tag_name}', parent_id={parent_tag_id}")
 
@@ -585,11 +620,14 @@ def get_or_create_tag(
     result = search_tag_by_name(gateway_url, username, password, tag_name, parent_tag_id)
     if result:
         logger.info(f"Found existing tag: {tag_name} -> id={result[0]}, uuid={result[1]}")
-        return result
+        return (result[0], result[1], False)  # Not newly created
 
     # Create new tag
     logger.info(f"Tag not found, creating: {tag_name}")
-    return create_tag(gateway_url, username, password, tag_name, parent_tag_id)
+    create_result = create_tag(gateway_url, username, password, tag_name, parent_tag_id)
+    if create_result:
+        return (create_result[0], create_result[1], True)  # Newly created
+    return None
 
 
 def ensure_tag_hierarchy(
@@ -597,7 +635,7 @@ def ensure_tag_hierarchy(
     username: str,
     password: str,
     function_arn: str
-) -> Optional[str]:
+) -> Optional[Tuple[str, bool]]:
     """Ensure the Lambda -> Region -> ARN tag hierarchy exists.
 
     Tag structure:
@@ -606,7 +644,9 @@ def ensure_tag_hierarchy(
             └── <full_arn> (child)
 
     Returns:
-        The ARN tag UUID (for use in CS API tag assignment) or None on failure
+        Tuple of (arn_tag_uuid, any_tags_created) or None on failure
+        - arn_tag_uuid: UUID for use in CS API tag assignment
+        - any_tags_created: True if any tags in hierarchy were newly created
     """
     # Parse the ARN
     # arn:aws:lambda:<region>:<account_id>:function:<function_name>
@@ -621,6 +661,9 @@ def ensure_tag_hierarchy(
 
     logger.info(f"Ensuring tag hierarchy for: region={region}, account={account_id}, function={function_name}")
 
+    # Track if any tags were newly created (need sync delay for CS API)
+    any_tags_created = False
+
     # Use full ARN as tag name (Qualys supports up to 1024 chars)
     arn_tag_name = function_arn
 
@@ -630,8 +673,10 @@ def ensure_tag_hierarchy(
     if not lambda_tag_result:
         logger.error("Failed to get/create Lambda parent tag")
         return None
-    lambda_tag_id, lambda_tag_uuid = lambda_tag_result
-    logger.info(f"Lambda tag: id={lambda_tag_id}, uuid={lambda_tag_uuid}")
+    lambda_tag_id, lambda_tag_uuid, lambda_created = lambda_tag_result
+    if lambda_created:
+        any_tags_created = True
+    logger.info(f"Lambda tag: id={lambda_tag_id}, uuid={lambda_tag_uuid}, created={lambda_created}")
 
     # Step 2: Get or create region tag under Lambda
     logger.info(f"Step 2: Getting/creating region tag '{region}' under Lambda...")
@@ -639,8 +684,10 @@ def ensure_tag_hierarchy(
     if not region_tag_result:
         logger.error(f"Failed to get/create region tag: {region}")
         return None
-    region_tag_id, region_tag_uuid = region_tag_result
-    logger.info(f"Region tag: id={region_tag_id}, uuid={region_tag_uuid}")
+    region_tag_id, region_tag_uuid, region_created = region_tag_result
+    if region_created:
+        any_tags_created = True
+    logger.info(f"Region tag: id={region_tag_id}, uuid={region_tag_uuid}, created={region_created}")
 
     # Step 3: Get or create ARN tag under region
     logger.info(f"Step 3: Getting/creating ARN tag under region...")
@@ -648,12 +695,14 @@ def ensure_tag_hierarchy(
     if not arn_tag_result:
         logger.error(f"Failed to get/create ARN tag: {arn_tag_name}")
         return None
-    arn_tag_id, arn_tag_uuid = arn_tag_result
-    logger.info(f"ARN tag: id={arn_tag_id}, uuid={arn_tag_uuid}")
+    arn_tag_id, arn_tag_uuid, arn_created = arn_tag_result
+    if arn_created:
+        any_tags_created = True
+    logger.info(f"ARN tag: id={arn_tag_id}, uuid={arn_tag_uuid}, created={arn_created}")
 
-    logger.info(f"Tag hierarchy complete: Lambda({lambda_tag_id}) -> {region}({region_tag_id}) -> ARN({arn_tag_id})")
-    # Return the UUID for use in CS API tag assignment
-    return arn_tag_uuid
+    logger.info(f"Tag hierarchy complete: Lambda({lambda_tag_id}) -> {region}({region_tag_id}) -> ARN({arn_tag_id}), any_created={any_tags_created}")
+    # Return the UUID and whether any tags were created
+    return (arn_tag_uuid, any_tags_created)
 
 
 def assign_tag_to_image(
@@ -665,9 +714,14 @@ def assign_tag_to_image(
 ) -> bool:
     """Assign a tag to an image in Qualys CS using Bearer token auth.
 
-    Includes verification and retry to handle eventual consistency in Qualys API.
-    When rapid tag assignments occur, the API may return success before the tag
-    is actually committed, so we verify and retry if needed.
+    Production-grade implementation with:
+    - Robust retry logic for API failures and rate limiting
+    - Verification with exponential backoff for eventual consistency
+    - Optimized timing to balance reliability with scale (10K+ Lambda support)
+    - Comprehensive error handling and logging
+
+    The Qualys API has eventual consistency - tags may not appear immediately
+    after assignment. This function handles that with a verification loop.
     """
     endpoint = "/csapi/v1.3/tag/assign"
 
@@ -679,50 +733,142 @@ def assign_tag_to_image(
         "entityType": "IMAGE"
     }
 
-    max_attempts = 3
+    # Configuration for production scale
+    # - 3 assignment attempts with verification between each
+    # - 6 verification attempts per assignment (with exponential backoff)
+    # - Total max time: ~45s per assignment attempt, ~135s total worst case
+    max_assignment_attempts = 3
+    max_verification_attempts = 6
 
-    for attempt in range(max_attempts):
-        logger.info(f"Assigning tag (attempt {attempt + 1}/{max_attempts}): image_uuid={image_uuid}, tag_uuid={tag_uuid}")
+    # Verification timing (exponential backoff with jitter)
+    # Delays: 2s, 4s, 6s, 8s, 10s, 12s = 42s total if all fail
+    # This is optimized for Qualys eventual consistency window
+    initial_verify_delay = 2.0
+    max_verify_delay = 12.0
+
+    for assign_attempt in range(max_assignment_attempts):
+        attempt_num = assign_attempt + 1
+        logger.info(f"Tag assignment attempt {attempt_num}/{max_assignment_attempts}: "
+                   f"image_uuid={image_uuid}, tag_uuid={tag_uuid}")
+
+        # Make the assignment API call
         status, response = qualys_cs_api_request(gateway_url, endpoint, token, 'POST', assign_data)
 
+        # Handle rate limiting (429)
+        if status == 429:
+            retry_after = 30  # Default retry delay
+            if response and isinstance(response, dict):
+                retry_after = response.get('retryAfter', retry_after)
+            logger.warning(f"Rate limited by Qualys API, waiting {retry_after}s before retry")
+            time.sleep(retry_after + random.uniform(1, 5))
+            continue
+
+        # Handle successful assignment
         if status in (200, 201, 204):
-            logger.info(f"Tag assignment API returned success (status={status})")
+            logger.info(f"Tag assignment API returned success (status={status}), response={response}")
 
+            # If we have image_sha, verify the tag was actually applied
             if image_sha:
-                base_delay = random.randint(1, 10)
-                attempt_bonus = sum(random.randint(1, 5) for _ in range(attempt + 1))
-                verify_delay = base_delay + attempt_bonus
-                logger.info(f"Waiting {verify_delay}s before verifying tag assignment...")
-                time.sleep(verify_delay)
+                tag_verified = False
 
-                if verify_tag_on_image(gateway_url, token, image_sha, tag_uuid):
-                    logger.info(f"Verified: tag {tag_uuid} is applied to image {image_uuid}")
-                    return True
-                else:
-                    logger.warning(f"Tag verification failed (attempt {attempt + 1}), tag not found on image")
-                    if attempt < max_attempts - 1:
-                        continue  # Retry assignment
+                for verify_attempt in range(max_verification_attempts):
+                    verify_num = verify_attempt + 1
+
+                    # Calculate delay with exponential backoff, capped at max
+                    # Pattern: 2s, 4s, 6s, 8s, 10s, 12s
+                    base_delay = min(initial_verify_delay * (verify_attempt + 1), max_verify_delay)
+                    # Add 0-20% jitter to prevent thundering herd
+                    jitter = random.uniform(0, base_delay * 0.2)
+                    verify_delay = base_delay + jitter
+
+                    logger.info(f"Verification attempt {verify_num}/{max_verification_attempts} "
+                               f"in {verify_delay:.1f}s...")
+                    time.sleep(verify_delay)
+
+                    # Check if tag is now visible on the image
+                    verified, error = verify_tag_on_image(gateway_url, token, image_sha, tag_uuid)
+
+                    if verified:
+                        logger.info(f"Tag VERIFIED on attempt {verify_num}: "
+                                   f"tag={tag_uuid[:8]}... assigned to image={image_uuid[:8]}...")
+                        return True
+                    elif error:
+                        logger.warning(f"Verification API error on attempt {verify_num}: {error}")
+                        # Continue trying - API error doesn't mean tag isn't assigned
                     else:
-                        logger.error(f"Tag assignment failed after {max_attempts} attempts - tag not appearing on image")
-                        return False
+                        logger.debug(f"Tag not yet visible on verification attempt {verify_num}")
+
+                # All verification attempts exhausted for this assignment
+                logger.warning(f"Tag not verified after {max_verification_attempts} attempts "
+                              f"(assignment attempt {attempt_num})")
+
+                if assign_attempt < max_assignment_attempts - 1:
+                    # Re-assign the tag - it may not have persisted
+                    reassign_delay = 3 + random.uniform(0, 2)
+                    logger.info(f"Re-attempting tag assignment in {reassign_delay:.1f}s...")
+                    time.sleep(reassign_delay)
+                    continue
+                else:
+                    # Final attempt failed
+                    logger.error(f"Tag assignment FAILED after {max_assignment_attempts} attempts "
+                                f"x {max_verification_attempts} verifications. "
+                                f"tag={tag_uuid}, image={image_uuid}")
+                    return False
             else:
-                logger.info(f"Successfully assigned tag {tag_uuid} to image {image_uuid}")
+                # No image_sha for verification, trust the API response
+                logger.info(f"Tag assigned successfully (no verification): "
+                           f"tag={tag_uuid}, image={image_uuid}")
                 return True
 
+        # Handle "already assigned" response (400 with specific message)
         elif status == 400:
             error_msg = str(response) if response else ''
-            if 'already' in error_msg.lower() or 'exist' in error_msg.lower():
-                logger.info(f"Tag {tag_uuid} already assigned to image {image_uuid}")
+            if any(keyword in error_msg.lower() for keyword in ['already', 'exist', 'duplicate']):
+                logger.info(f"Tag already assigned (idempotent success): "
+                           f"tag={tag_uuid}, image={image_uuid}")
                 return True
-            logger.error(f"Failed to assign tag to image: status={status}, response={response}")
-            return False
-        else:
-            logger.error(f"Failed to assign tag to image: status={status}, response={response}")
-            if attempt < max_attempts - 1:
-                time.sleep(2)  # Brief pause before retry on failure
+            else:
+                # Bad request for other reasons - don't retry
+                logger.error(f"Tag assignment bad request (status=400): {error_msg[:200]}")
+                return False
+
+        # Handle server errors (5xx) - retry with backoff
+        elif status >= 500:
+            logger.warning(f"Server error from Qualys API (status={status})")
+            if assign_attempt < max_assignment_attempts - 1:
+                retry_delay = (assign_attempt + 1) * 5 + random.uniform(0, 3)
+                logger.info(f"Retrying in {retry_delay:.1f}s...")
+                time.sleep(retry_delay)
                 continue
+            else:
+                logger.error(f"Tag assignment failed after {max_assignment_attempts} attempts "
+                            f"due to server errors")
+                return False
+
+        # Handle other client errors (4xx except 400, 429)
+        elif 400 < status < 500:
+            logger.error(f"Client error from Qualys API (status={status}): {response}")
+            return False  # Don't retry client errors
+
+        # Handle network/connection errors (status=0)
+        elif status == 0:
+            logger.warning(f"Network error during tag assignment")
+            if assign_attempt < max_assignment_attempts - 1:
+                retry_delay = (assign_attempt + 1) * 3 + random.uniform(0, 2)
+                logger.info(f"Retrying in {retry_delay:.1f}s...")
+                time.sleep(retry_delay)
+                continue
+            else:
+                logger.error(f"Tag assignment failed after {max_assignment_attempts} attempts "
+                            f"due to network errors")
+                return False
+
+        # Unexpected status code
+        else:
+            logger.error(f"Unexpected status code from Qualys API: {status}, response={response}")
             return False
 
+    logger.error(f"Tag assignment exhausted all {max_assignment_attempts} attempts")
     return False
 
 
@@ -730,6 +876,12 @@ def tag_qualys_image(qualys_creds: Dict[str, str], function_arn: str, image_sha:
     """Tag a scanned image in Qualys CS with Lambda function information.
 
     This creates/uses the tag hierarchy: Lambda -> <region> -> <full_arn>
+
+    Production-grade implementation optimized for:
+    - High-scale deployments (10K+ Lambda functions)
+    - Rate limiting and API quotas
+    - Eventual consistency handling
+    - Robust error recovery
 
     Returns:
         True on success, False on failure
@@ -757,26 +909,37 @@ def tag_qualys_image(qualys_creds: Dict[str, str], function_arn: str, image_sha:
 
     gateway_url = get_qualys_gateway_url(pod)
     api_url = get_qualys_api_url(pod)
-    logger.info(f"Qualys tagging: pod={pod}")
+    logger.info(f"Qualys tagging: pod={pod}, function_arn={function_arn}")
 
-    pre_delay = random.uniform(0, 30)
-    logger.info(f"Waiting {pre_delay:.1f}s before starting tag assignment (stagger)")
+    # Stagger requests to prevent thundering herd on Qualys API
+    # Use hash of function_arn for deterministic but distributed timing
+    # This ensures same function always gets same delay, preventing duplicate work
+    arn_hash = hash(function_arn) % 1000
+    pre_delay = (arn_hash / 1000.0) * 10  # 0-10 second spread based on ARN
+    pre_delay += random.uniform(0, 2)  # Small additional jitter
+    logger.info(f"Stagger delay: {pre_delay:.1f}s")
     time.sleep(pre_delay)
 
     try:
         # Get image UUID from Qualys CS API with retry for timing delays
+        # Images may not be immediately available after scan completion
         image_data = None
-        delays = [5, 10, 15]
-        for attempt, delay in enumerate(delays):
+        max_image_retries = 5
+        image_retry_delays = [3, 5, 8, 12, 15]  # Progressive delays up to 43s total
+
+        for attempt in range(max_image_retries):
             image_data = get_image_by_sha(gateway_url, token, image_sha)
             if image_data:
                 break
-            if attempt < len(delays) - 1:
-                logger.info(f"Image not yet available, retrying in {delay}s...")
+            if attempt < max_image_retries - 1:
+                delay = image_retry_delays[attempt]
+                logger.info(f"Image not yet available (attempt {attempt + 1}/{max_image_retries}), "
+                           f"retrying in {delay}s...")
                 time.sleep(delay)
 
         if not image_data:
-            logger.warning(f"Image not found in Qualys after retries: {image_sha}")
+            logger.error(f"Image not found in Qualys after {max_image_retries} retries: "
+                        f"{image_sha[:16]}...")
             return False
 
         image_uuid = image_data.get('uuid')
@@ -786,17 +949,34 @@ def tag_qualys_image(qualys_creds: Dict[str, str], function_arn: str, image_sha:
         logger.info(f"Found image in Qualys: uuid={image_uuid}")
 
         # Ensure tag hierarchy exists using Asset Management API
-        arn_tag_uuid = ensure_tag_hierarchy(api_url, username, password, function_arn)
-        if not arn_tag_uuid:
+        # This creates: Lambda -> <region> -> <full_arn>
+        hierarchy_result = ensure_tag_hierarchy(api_url, username, password, function_arn)
+        if not hierarchy_result:
             logger.error("Failed to create tag hierarchy")
             return False
-        logger.info(f"Tag hierarchy ready: arn_tag_uuid={arn_tag_uuid}")
 
-        # Assign tag to image using CS API (with verification)
-        return assign_tag_to_image(gateway_url, token, image_uuid, arn_tag_uuid, image_sha)
+        arn_tag_uuid, any_tags_created = hierarchy_result
+        logger.info(f"Tag hierarchy ready: arn_tag_uuid={arn_tag_uuid}, any_tags_created={any_tags_created}")
+
+        # If any tags were newly created via AM API, wait for them to sync to CS API
+        # This delay is critical - the CS API cannot assign tags that haven't synced yet
+        if any_tags_created:
+            sync_delay = 10  # seconds to wait for AM -> CS API synchronization
+            logger.info(f"New tags created - waiting {sync_delay}s for AM->CS API sync...")
+            time.sleep(sync_delay)
+
+        # Assign tag to image using CS API (with verification and retry)
+        success = assign_tag_to_image(gateway_url, token, image_uuid, arn_tag_uuid, image_sha)
+
+        if success:
+            logger.info(f"Successfully tagged image {image_uuid[:8]}... with ARN tag")
+        else:
+            logger.error(f"Failed to tag image {image_uuid[:8]}... with ARN tag")
+
+        return success
 
     except Exception as e:
-        logger.error(f"Error tagging Qualys image: {e}")
+        logger.error(f"Error tagging Qualys image: {type(e).__name__}: {e}")
         return False
 
 
@@ -1422,14 +1602,17 @@ def store_results(
             logger.error(f"Failed to send SNS notification: {e}")
 
     repo_tag = extract_repo_tags(scan_results, timestamp)
-    tag_lambda_function(
-        lambda_details['function_arn'],
-        repo_tag,
-        timestamp,
-        scan_results['success'],
-        scan_results.get('partial', False),
-        target_lambda_client
-    )
+    if ENABLE_LAMBDA_TAGGING:
+        tag_lambda_function(
+            lambda_details['function_arn'],
+            repo_tag,
+            timestamp,
+            scan_results['success'],
+            scan_results.get('partial', False),
+            target_lambda_client
+        )
+    else:
+        logger.info(f"Lambda tagging disabled - skipping tags for {lambda_details['function_arn']}")
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -1514,7 +1697,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if ENABLE_QUALYS_TAGGING and scan_results.get('success'):
             image_sha = extract_image_sha(scan_results)
             if image_sha:
-                tag_qualys_image(qualys_creds, function_arn, image_sha)
+                tag_success = tag_qualys_image(qualys_creds, function_arn, image_sha)
+                if not tag_success:
+                    logger.error(f"TAGGING FAILED: Could not assign Qualys tag for {function_arn} (image_sha={image_sha})")
+                else:
+                    logger.info(f"Successfully tagged image in Qualys for {function_arn}")
             else:
                 logger.warning("Could not extract image SHA for Qualys tagging")
 

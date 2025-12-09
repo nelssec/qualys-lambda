@@ -42,9 +42,51 @@ make deploy QUALYS_POD=US2 TAG=true USERNAME=your-username PASSWORD='your-passwo
 | `QUALYS_POD` | US2 | Qualys platform |
 | `AWS_REGION` | us-east-1 | AWS region |
 | `STACK_NAME` | qualys-lambda-scanner | CloudFormation stack name |
-| `TAG` | false | Enable Qualys image tagging |
+| `TAG` | true | Enable Qualys image tagging |
+| `LAMBDA_TAG` | true | Enable AWS Lambda resource tagging |
 | `USERNAME` | - | Qualys API username |
 | `PASSWORD` | - | Qualys API password |
+
+### Tagging Options
+
+The scanner supports two independent tagging systems:
+
+| Option | Environment Variable | Description |
+|--------|---------------------|-------------|
+| Qualys Tagging | `ENABLE_QUALYS_TAGGING` | Tags images in Qualys Container Security with Lambda ARN hierarchy |
+| Lambda Tagging | `ENABLE_LAMBDA_TAGGING` | Applies AWS resource tags to Lambda functions |
+
+#### Examples
+
+```bash
+# Full deployment with both tagging systems enabled (default)
+make deploy QUALYS_POD=US2 TAG=true USERNAME=user PASSWORD='pass'
+
+# Disable Lambda tagging (for customers with policies that forbid Lambda tags)
+make deploy QUALYS_POD=US2 TAG=true LAMBDA_TAG=false USERNAME=user PASSWORD='pass'
+
+# Disable Qualys tagging but keep Lambda tagging
+make deploy QUALYS_POD=US2 TAG=false LAMBDA_TAG=true
+
+# Disable all tagging (scan results still stored in DynamoDB and S3)
+make deploy QUALYS_POD=US2 TAG=false LAMBDA_TAG=false
+```
+
+#### CloudFormation Parameters
+
+When deploying directly with CloudFormation:
+
+```bash
+aws cloudformation deploy \
+  --template-file cloudformation/single-account-native.yaml \
+  --stack-name qualys-lambda-scanner \
+  --parameter-overrides \
+    QualysPod=US2 \
+    EnableQualysTagging=true \
+    EnableLambdaTagging=false \
+    QualysSecretArn=arn:aws:secretsmanager:... \
+  --capabilities CAPABILITY_IAM
+```
 
 ## How It Works
 

@@ -132,7 +132,15 @@ Parameters:
   EnableQualysTagging:
     Type: String
     Description: 'Enable Qualys Container Security tagging to link images to Lambda ARNs'
-    Default: 'false'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  EnableLambdaTagging:
+    Type: String
+    Description: 'Enable AWS Lambda resource tagging with scan results'
+    Default: 'true'
     AllowedValues:
       - 'true'
       - 'false'
@@ -493,6 +501,7 @@ Resources:
           CACHE_TTL_DAYS: !Ref CacheTTLDays
           QSCANNER_PATH: '/opt/bin/qscanner'
           ENABLE_QUALYS_TAGGING: !Ref EnableQualysTagging
+          ENABLE_LAMBDA_TAGGING: !Ref EnableLambdaTagging
       Tags:
         - Key: Name
           Value: 'qualys-lambda-scanner'
