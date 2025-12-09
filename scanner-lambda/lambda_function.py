@@ -344,6 +344,24 @@ def get_image_by_sha(gateway_url: str, token: str, image_sha: str) -> Optional[D
     return None
 
 
+def verify_tag_on_image(gateway_url: str, token: str, image_sha: str, tag_uuid: str) -> bool:
+    """Verify that a specific tag is assigned to an image in Qualys CS.
+
+    Returns True if the tag is found on the image, False otherwise.
+    """
+    image_data = get_image_by_sha(gateway_url, token, image_sha)
+    if not image_data:
+        return False
+
+    # Check if the tag is in the image's tags list
+    tags = image_data.get('tags', [])
+    for tag in tags:
+        if tag.get('uuid') == tag_uuid or tag.get('tagUuid') == tag_uuid:
+            return True
+
+    return False
+
+
 def validate_qualys_tag_name(tag_name: str) -> bool:
     """Validate tag name for Qualys compatibility.
 
@@ -642,9 +660,15 @@ def assign_tag_to_image(
     gateway_url: str,
     token: str,
     image_uuid: str,
-    tag_uuid: str
+    tag_uuid: str,
+    image_sha: str = None
 ) -> bool:
-    """Assign a tag to an image in Qualys CS using Bearer token auth."""
+    """Assign a tag to an image in Qualys CS using Bearer token auth.
+
+    Includes verification and retry to handle eventual consistency in Qualys API.
+    When rapid tag assignments occur, the API may return success before the tag
+    is actually committed, so we verify and retry if needed.
+    """
     endpoint = "/csapi/v1.3/tag/assign"
 
     assign_data = {
@@ -655,23 +679,51 @@ def assign_tag_to_image(
         "entityType": "IMAGE"
     }
 
-    logger.info(f"Assigning tag: image_uuid={image_uuid}, tag_uuid={tag_uuid}")
-    status, response = qualys_cs_api_request(gateway_url, endpoint, token, 'POST', assign_data)
+    max_attempts = 3
 
-    if status in (200, 201, 204):
-        logger.info(f"Successfully assigned tag {tag_uuid} to image {image_uuid}")
-        return True
-    elif status == 400:
-        # Check if tag is already assigned - treat as success
-        error_msg = str(response) if response else ''
-        if 'already' in error_msg.lower() or 'exist' in error_msg.lower():
-            logger.info(f"Tag {tag_uuid} already assigned to image {image_uuid}")
-            return True
-        logger.error(f"Failed to assign tag to image: status={status}, response={response}")
-        return False
-    else:
-        logger.error(f"Failed to assign tag to image: status={status}, response={response}")
-        return False
+    for attempt in range(max_attempts):
+        logger.info(f"Assigning tag (attempt {attempt + 1}/{max_attempts}): image_uuid={image_uuid}, tag_uuid={tag_uuid}")
+        status, response = qualys_cs_api_request(gateway_url, endpoint, token, 'POST', assign_data)
+
+        if status in (200, 201, 204):
+            logger.info(f"Tag assignment API returned success (status={status})")
+
+            if image_sha:
+                base_delay = random.randint(1, 10)
+                attempt_bonus = sum(random.randint(1, 5) for _ in range(attempt + 1))
+                verify_delay = base_delay + attempt_bonus
+                logger.info(f"Waiting {verify_delay}s before verifying tag assignment...")
+                time.sleep(verify_delay)
+
+                if verify_tag_on_image(gateway_url, token, image_sha, tag_uuid):
+                    logger.info(f"Verified: tag {tag_uuid} is applied to image {image_uuid}")
+                    return True
+                else:
+                    logger.warning(f"Tag verification failed (attempt {attempt + 1}), tag not found on image")
+                    if attempt < max_attempts - 1:
+                        continue  # Retry assignment
+                    else:
+                        logger.error(f"Tag assignment failed after {max_attempts} attempts - tag not appearing on image")
+                        return False
+            else:
+                logger.info(f"Successfully assigned tag {tag_uuid} to image {image_uuid}")
+                return True
+
+        elif status == 400:
+            error_msg = str(response) if response else ''
+            if 'already' in error_msg.lower() or 'exist' in error_msg.lower():
+                logger.info(f"Tag {tag_uuid} already assigned to image {image_uuid}")
+                return True
+            logger.error(f"Failed to assign tag to image: status={status}, response={response}")
+            return False
+        else:
+            logger.error(f"Failed to assign tag to image: status={status}, response={response}")
+            if attempt < max_attempts - 1:
+                time.sleep(2)  # Brief pause before retry on failure
+                continue
+            return False
+
+    return False
 
 
 def tag_qualys_image(qualys_creds: Dict[str, str], function_arn: str, image_sha: str) -> bool:
@@ -707,6 +759,10 @@ def tag_qualys_image(qualys_creds: Dict[str, str], function_arn: str, image_sha:
     api_url = get_qualys_api_url(pod)
     logger.info(f"Qualys tagging: pod={pod}")
 
+    pre_delay = random.uniform(0, 30)
+    logger.info(f"Waiting {pre_delay:.1f}s before starting tag assignment (stagger)")
+    time.sleep(pre_delay)
+
     try:
         # Get image UUID from Qualys CS API with retry for timing delays
         image_data = None
@@ -736,8 +792,8 @@ def tag_qualys_image(qualys_creds: Dict[str, str], function_arn: str, image_sha:
             return False
         logger.info(f"Tag hierarchy ready: arn_tag_uuid={arn_tag_uuid}")
 
-        # Assign tag to image using CS API
-        return assign_tag_to_image(gateway_url, token, image_uuid, arn_tag_uuid)
+        # Assign tag to image using CS API (with verification)
+        return assign_tag_to_image(gateway_url, token, image_uuid, arn_tag_uuid, image_sha)
 
     except Exception as e:
         logger.error(f"Error tagging Qualys image: {e}")
