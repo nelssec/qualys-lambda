@@ -107,9 +107,9 @@ Parameters:
 
   ScannerReservedConcurrency:
     Type: Number
-    Description: 'Reserved concurrent executions for Scanner Lambda (prevents runaway invocations)'
-    Default: 5
-    MinValue: 1
+    Description: 'Reserved concurrent executions for Scanner Lambda (0 = no limit)'
+    Default: 0
+    MinValue: 0
     MaxValue: 100
 
   EnableQualysTagging:
@@ -143,6 +143,7 @@ Conditions:
     - !Condition CreateBulkScan
     - !Not [!Equals [!Ref BulkScanSchedule, '']]
   UseS3Code: !Not [!Equals [!Ref LambdaCodeBucket, '']]
+  HasReservedConcurrency: !Not [!Equals [!Ref ScannerReservedConcurrency, 0]]
 
 Resources:
   # KMS key for encrypting sensitive data (DynamoDB, SQS, SNS, CloudWatch Logs)
@@ -405,19 +406,6 @@ Resources:
       RetentionInDays: 30
       KmsKeyId: !GetAtt ScannerKMSKey.Arn
 
-  # Package Lambda function code into S3
-  LambdaCodeBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub '${AWS::StackName}-lambda-code-${AWS::AccountId}'
-      VersioningConfiguration:
-        Status: Enabled
-      LifecycleConfiguration:
-        Rules:
-          - Id: DeleteOldVersions
-            Status: Enabled
-            NoncurrentVersionExpirationInDays: 30
-
   ScannerLambdaFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -428,8 +416,8 @@ Resources:
       Role: !GetAtt ScannerLambdaRole.Arn
       MemorySize: !Ref ScannerMemorySize
       Timeout: !Ref ScannerTimeout
-      # Reserved concurrency prevents runaway invocations during mass Lambda deployments
-      ReservedConcurrentExecutions: !Ref ScannerReservedConcurrency
+      # Reserved concurrency prevents runaway invocations (0 = no limit)
+      ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref ScannerReservedConcurrency, !Ref 'AWS::NoValue']
       EphemeralStorage:
         Size: !Ref ScannerEphemeralStorage
       Layers:

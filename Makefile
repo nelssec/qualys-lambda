@@ -112,7 +112,8 @@ create-bucket:
 upload-function: package create-bucket
 	@echo "Uploading Lambda function code to S3..."
 	@aws s3 cp build/scanner-function.zip s3://$(S3_BUCKET)/scanner-function.zip
-	@echo "Function code uploaded to s3://$(S3_BUCKET)/scanner-function.zip"
+	@aws s3 cp build/bulk-scan.zip s3://$(S3_BUCKET)/bulk-scan.zip
+	@echo "Function code uploaded to s3://$(S3_BUCKET)/"
 
 # Create Secrets Manager secret
 create-secret:
@@ -161,6 +162,9 @@ deploy: publish-layer upload-function create-secret
 			QualysPod=$(QUALYS_POD) \
 			QualysSecretArn=$$(cat build/secret-arn.txt) \
 			QScannerLayerArn=$$(cat build/layer-arn.txt) \
+			LambdaCodeBucket=$(S3_BUCKET) \
+			LambdaCodeKey=scanner-function.zip \
+			BulkScanCodeKey=bulk-scan.zip \
 			EnableQualysTagging=$(TAG) \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--region $(AWS_REGION)
