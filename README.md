@@ -7,11 +7,11 @@ Automated security scanning for AWS Lambda functions using Qualys QScanner.
 ```bash
 export QUALYS_ACCESS_TOKEN="your-qualys-access-token"
 
-# Basic deployment
+# Basic deployment (Lambda tagging enabled by default)
 make deploy QUALYS_POD=US2
 
-# With Qualys image tagging
-make deploy QUALYS_POD=US2 TAG=true USERNAME=your-username PASSWORD='your-password'
+# Disable Lambda tagging
+make deploy QUALYS_POD=US2 TAG=false
 ```
 
 ## Resources Deployed
@@ -42,34 +42,24 @@ make deploy QUALYS_POD=US2 TAG=true USERNAME=your-username PASSWORD='your-passwo
 | `QUALYS_POD` | US2 | Qualys platform |
 | `AWS_REGION` | us-east-1 | AWS region |
 | `STACK_NAME` | qualys-lambda-scanner | CloudFormation stack name |
-| `TAG` | true | Enable Qualys image tagging |
-| `LAMBDA_TAG` | true | Enable AWS Lambda resource tagging |
-| `USERNAME` | - | Qualys API username |
-| `PASSWORD` | - | Qualys API password |
+| `TAG` | true | Enable AWS Lambda resource tagging |
 
 ### Tagging Options
 
-The scanner supports two independent tagging systems:
+Lambda tagging is enabled by default. When enabled, the scanner applies AWS resource tags to Lambda functions after each scan.
 
 | Option | Environment Variable | Description |
 |--------|---------------------|-------------|
-| Qualys Tagging | `ENABLE_QUALYS_TAGGING` | Tags images in Qualys Container Security with Lambda ARN hierarchy |
-| Lambda Tagging | `ENABLE_LAMBDA_TAGGING` | Applies AWS resource tags to Lambda functions |
+| Lambda Tagging | `ENABLE_TAGGING` | Applies AWS resource tags to Lambda functions |
 
 #### Examples
 
 ```bash
-# Full deployment with both tagging systems enabled (default)
-make deploy QUALYS_POD=US2 TAG=true USERNAME=user PASSWORD='pass'
+# Standard deployment with Lambda tagging enabled (default)
+make deploy QUALYS_POD=US2
 
 # Disable Lambda tagging (for customers with policies that forbid Lambda tags)
-make deploy QUALYS_POD=US2 TAG=true LAMBDA_TAG=false USERNAME=user PASSWORD='pass'
-
-# Disable Qualys tagging but keep Lambda tagging
-make deploy QUALYS_POD=US2 TAG=false LAMBDA_TAG=true
-
-# Disable all tagging (scan results still stored in DynamoDB and S3)
-make deploy QUALYS_POD=US2 TAG=false LAMBDA_TAG=false
+make deploy QUALYS_POD=US2 TAG=false
 ```
 
 #### CloudFormation Parameters
@@ -82,8 +72,7 @@ aws cloudformation deploy \
   --stack-name qualys-lambda-scanner \
   --parameter-overrides \
     QualysPod=US2 \
-    EnableQualysTagging=true \
-    EnableLambdaTagging=false \
+    EnableTagging=true \
     QualysSecretArn=arn:aws:secretsmanager:... \
   --capabilities CAPABILITY_IAM
 ```
@@ -128,7 +117,6 @@ aws lambda invoke \
 |-----|---------|
 | `QualysScanTimestamp` | 2025-01-15T10:30:00Z |
 | `QualysScanStatus` | success, partial, failed |
-| `QualysScanTag` | 1765239685 |
 
 ## Troubleshooting
 
@@ -160,7 +148,7 @@ make update-function
 
 Full redeploy:
 ```bash
-make deploy QUALYS_POD=US2 TAG=true USERNAME=user PASSWORD='pass'
+make deploy QUALYS_POD=US2
 ```
 
 ## Cleanup
@@ -174,7 +162,7 @@ Empty the S3 bucket first if it contains scan results.
 ## Multi-Region Deployment
 
 ```bash
-make deploy-multi-region QUALYS_POD=US2 TAG=true USERNAME=user PASSWORD='pass'
+make deploy-multi-region QUALYS_POD=US2
 ```
 
 Or deploy to each region individually:
@@ -194,8 +182,7 @@ Deploy a standalone scanner to all accounts in your AWS Organization:
 export QUALYS_ACCESS_TOKEN="your-token"
 
 make deploy-stackset QUALYS_POD=US2 \
-  ORG_UNIT_IDS="ou-xxxx-xxxxxxxx,ou-yyyy-yyyyyyyy" \
-  TAG=true USERNAME=user PASSWORD='pass'
+  ORG_UNIT_IDS="ou-xxxx-xxxxxxxx,ou-yyyy-yyyyyyyy"
 ```
 
 ### Hub-Spoke
@@ -205,7 +192,7 @@ Deploy a central scanner in a security account that scans Lambda functions in me
 Deploy the hub:
 ```bash
 export QUALYS_ACCESS_TOKEN="your-token"
-make deploy-hub QUALYS_POD=US2 TAG=true USERNAME=user PASSWORD='pass'
+make deploy-hub QUALYS_POD=US2
 ```
 
 Deploy spokes to member accounts:

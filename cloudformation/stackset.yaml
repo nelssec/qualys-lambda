@@ -27,17 +27,6 @@ Parameters:
     Description: 'Qualys Access Token (will be stored in Secrets Manager)'
     NoEcho: true
 
-  QualysApiUsername:
-    Type: String
-    Description: 'Qualys API Username (required for tagging feature)'
-    Default: ''
-
-  QualysApiPassword:
-    Type: String
-    Description: 'Qualys API Password (required for tagging feature)'
-    NoEcho: true
-    Default: ''
-
   ArtifactsBucket:
     Type: String
     Description: 'S3 bucket containing Lambda code and layer artifacts (must be accessible by all org accounts)'
@@ -129,15 +118,7 @@ Parameters:
     Description: 'S3 key for bulk scan Lambda code zip'
     Default: 'qualys-lambda-scanner/bulk-scan.zip'
 
-  EnableQualysTagging:
-    Type: String
-    Description: 'Enable Qualys Container Security tagging to link images to Lambda ARNs'
-    Default: 'true'
-    AllowedValues:
-      - 'true'
-      - 'false'
-
-  EnableLambdaTagging:
+  EnableTagging:
     Type: String
     Description: 'Enable AWS Lambda resource tagging with scan results'
     Default: 'true'
@@ -214,9 +195,7 @@ Resources:
       SecretString: !Sub |
         {
           "qualys_pod": "${QualysPod}",
-          "qualys_access_token": "${QualysAccessToken}",
-          "qualys_api_username": "${QualysApiUsername}",
-          "qualys_api_password": "${QualysApiPassword}"
+          "qualys_access_token": "${QualysAccessToken}"
         }
       Tags:
         - Key: Name
@@ -500,8 +479,7 @@ Resources:
           SCAN_TIMEOUT: '300'
           CACHE_TTL_DAYS: !Ref CacheTTLDays
           QSCANNER_PATH: '/opt/bin/qscanner'
-          ENABLE_QUALYS_TAGGING: !Ref EnableQualysTagging
-          ENABLE_LAMBDA_TAGGING: !Ref EnableLambdaTagging
+          ENABLE_TAGGING: !Ref EnableTagging
       Tags:
         - Key: Name
           Value: 'qualys-lambda-scanner'

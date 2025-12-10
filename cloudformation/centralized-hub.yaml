@@ -27,27 +27,7 @@ Parameters:
     Description: 'Qualys Access Token (will be stored in Secrets Manager)'
     NoEcho: true
 
-  QualysApiUsername:
-    Type: String
-    Description: 'Qualys API Username for CS API calls (optional, for image tagging)'
-    Default: ''
-    NoEcho: true
-
-  QualysApiPassword:
-    Type: String
-    Description: 'Qualys API Password for CS API calls (optional, for image tagging)'
-    Default: ''
-    NoEcho: true
-
-  EnableQualysTagging:
-    Type: String
-    Description: 'Enable Qualys Container Security tagging to link images to Lambda ARNs'
-    Default: 'true'
-    AllowedValues:
-      - 'true'
-      - 'false'
-
-  EnableLambdaTagging:
+  EnableTagging:
     Type: String
     Description: 'Enable AWS Lambda resource tagging with scan results (set false if customer policy forbids Lambda tags)'
     Default: 'true'
@@ -267,9 +247,7 @@ Resources:
       SecretString: !Sub |
         {
           "qualys_pod": "${QualysPod}",
-          "qualys_access_token": "${QualysAccessToken}",
-          "qualys_api_username": "${QualysApiUsername}",
-          "qualys_api_password": "${QualysApiPassword}"
+          "qualys_access_token": "${QualysAccessToken}"
         }
       Tags:
         - Key: Name
@@ -564,8 +542,7 @@ Resources:
           CROSS_ACCOUNT_ROLE_NAME: 'qualys-lambda-scanner-spoke-role'
           SCANNER_EXTERNAL_ID: !Ref ScannerExternalId
           QSCANNER_PATH: '/opt/bin/qscanner'
-          ENABLE_QUALYS_TAGGING: !Ref EnableQualysTagging
-          ENABLE_LAMBDA_TAGGING: !Ref EnableLambdaTagging
+          ENABLE_TAGGING: !Ref EnableTagging
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-scanner'

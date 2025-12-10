@@ -8,11 +8,8 @@ LAYER_NAME ?= qscanner
 S3_BUCKET ?= $(STACK_NAME)-artifacts-$(shell aws sts get-caller-identity --query Account --output text)
 QUALYS_ACCESS_TOKEN ?= $(shell echo $$QUALYS_ACCESS_TOKEN)
 
-# Tagging variables (optional)
+# Tagging variable (optional - defaults to true)
 TAG ?= true
-LAMBDA_TAG ?= true
-USERNAME ?=
-PASSWORD ?=
 
 # Cross-account security
 EXTERNAL_ID ?= $(shell openssl rand -hex 16)
@@ -52,16 +49,13 @@ help:
 	@echo "  QUALYS_POD           - Qualys POD (default: US2)"
 	@echo "  QUALYS_ACCESS_TOKEN  - Qualys access token (required, or set env var)"
 	@echo "  ORG_UNIT_IDS         - Comma-separated OU IDs for StackSet deployment"
-	@echo "  TAG                  - Enable Qualys image tagging (true/false, default: true)"
-	@echo "  LAMBDA_TAG           - Enable Lambda resource tagging (true/false, default: true)"
-	@echo "  USERNAME             - Qualys API username (required if TAG=true)"
-	@echo "  PASSWORD             - Qualys API password (required if TAG=true)"
+	@echo "  TAG                  - Enable Lambda resource tagging (true/false, default: true)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make deploy QUALYS_POD=US2 AWS_REGION=us-east-1"
-	@echo "  make deploy TAG=true USERNAME=myuser PASSWORD=mypass"
-	@echo "  make deploy-hub TAG=true USERNAME=myuser PASSWORD=mypass"
-	@echo "  make deploy-stackset ORG_UNIT_IDS=ou-xxxx TAG=true USERNAME=myuser PASSWORD=mypass"
+	@echo "  make deploy TAG=false  # Disable Lambda tagging"
+	@echo "  make deploy-hub"
+	@echo "  make deploy-stackset ORG_UNIT_IDS=ou-xxxx"
 
 # =============================================================================
 # Build Targets
@@ -125,11 +119,7 @@ create-secret:
 		exit 1; \
 	fi
 	@mkdir -p build
-	@if [ -n "$(USERNAME)" ] && [ -n "$(PASSWORD)" ]; then \
-		SECRET_JSON='{"qualys_pod":"$(QUALYS_POD)","qualys_access_token":"$(QUALYS_ACCESS_TOKEN)","qualys_api_username":"$(USERNAME)","qualys_api_password":"$(PASSWORD)"}'; \
-	else \
-		SECRET_JSON='{"qualys_pod":"$(QUALYS_POD)","qualys_access_token":"$(QUALYS_ACCESS_TOKEN)"}'; \
-	fi; \
+	@SECRET_JSON='{"qualys_pod":"$(QUALYS_POD)","qualys_access_token":"$(QUALYS_ACCESS_TOKEN)"}'; \
 	SECRET_ARN=$$(aws secretsmanager create-secret \
 		--name "$(STACK_NAME)-qualys-credentials" \
 		--description "Qualys credentials for Lambda scanner" \
@@ -152,11 +142,6 @@ create-secret:
 # Deploy to single account/region
 deploy: publish-layer upload-function create-secret
 	@echo "Deploying CloudFormation stack..."
-	@if [ "$(TAG)" = "true" ] && { [ -z "$(USERNAME)" ] || [ -z "$(PASSWORD)" ]; }; then \
-		echo "ERROR: TAG=true requires USERNAME and PASSWORD"; \
-		echo "Usage: make deploy TAG=true USERNAME=myuser PASSWORD=mypass"; \
-		exit 1; \
-	fi
 	@aws cloudformation deploy \
 		--template-file cloudformation/single-account-native.yaml \
 		--stack-name $(STACK_NAME) \
@@ -167,8 +152,7 @@ deploy: publish-layer upload-function create-secret
 			LambdaCodeBucket=$(S3_BUCKET) \
 			LambdaCodeKey=scanner-function.zip \
 			BulkScanCodeKey=bulk-scan.zip \
-			EnableQualysTagging=$(TAG) \
-			EnableLambdaTagging=$(LAMBDA_TAG) \
+			EnableTagging=$(TAG) \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--region $(AWS_REGION)
 	@echo "Deployment complete!"
@@ -248,11 +232,6 @@ deploy-stackset: upload-artifacts
 		echo "Usage: make deploy-stackset ORG_UNIT_IDS=ou-xxxx-xxxxxxxx"; \
 		exit 1; \
 	fi
-	@if [ "$(TAG)" = "true" ] && { [ -z "$(USERNAME)" ] || [ -z "$(PASSWORD)" ]; }; then \
-		echo "ERROR: TAG=true requires USERNAME and PASSWORD"; \
-		echo "Usage: make deploy-stackset ORG_UNIT_IDS=ou-xxxx TAG=true USERNAME=myuser PASSWORD=mypass"; \
-		exit 1; \
-	fi
 	@BUCKET=$$(cat build/artifacts-bucket.txt); \
 	aws cloudformation create-stack-set \
 		--stack-set-name $(STACK_NAME)-stackset \
@@ -261,10 +240,7 @@ deploy-stackset: upload-artifacts
 			ParameterKey=QualysPod,ParameterValue=$(QUALYS_POD) \
 			ParameterKey=QualysAccessToken,ParameterValue=$(QUALYS_ACCESS_TOKEN) \
 			ParameterKey=ArtifactsBucket,ParameterValue=$$BUCKET \
-			ParameterKey=EnableQualysTagging,ParameterValue=$(TAG) \
-			ParameterKey=EnableLambdaTagging,ParameterValue=$(LAMBDA_TAG) \
-			ParameterKey=QualysApiUsername,ParameterValue=$(USERNAME) \
-			ParameterKey=QualysApiPassword,ParameterValue=$(PASSWORD) \
+			ParameterKey=EnableTagging,ParameterValue=$(TAG) \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--permission-model SERVICE_MANAGED \
 		--auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
@@ -276,10 +252,7 @@ deploy-stackset: upload-artifacts
 				ParameterKey=QualysPod,ParameterValue=$(QUALYS_POD) \
 				ParameterKey=QualysAccessToken,ParameterValue=$(QUALYS_ACCESS_TOKEN) \
 				ParameterKey=ArtifactsBucket,ParameterValue=$$BUCKET \
-				ParameterKey=EnableQualysTagging,ParameterValue=$(TAG) \
-				ParameterKey=EnableLambdaTagging,ParameterValue=$(LAMBDA_TAG) \
-				ParameterKey=QualysApiUsername,ParameterValue=$(USERNAME) \
-				ParameterKey=QualysApiPassword,ParameterValue=$(PASSWORD) \
+				ParameterKey=EnableTagging,ParameterValue=$(TAG) \
 			--capabilities CAPABILITY_NAMED_IAM \
 			--region $(AWS_REGION)
 	@echo "Creating stack instances in OUs: $(ORG_UNIT_IDS)..."
@@ -324,13 +297,6 @@ deploy-hub: upload-artifacts
 		echo "ERROR: QUALYS_ACCESS_TOKEN environment variable not set"; \
 		exit 1; \
 	fi
-	@if [ "$(TAG)" = "true" ]; then \
-		if [ -z "$(USERNAME)" ] || [ -z "$(PASSWORD)" ]; then \
-			echo "ERROR: TAG=true requires USERNAME and PASSWORD"; \
-			echo "Usage: make deploy-hub TAG=true USERNAME=myuser PASSWORD=mypass"; \
-			exit 1; \
-		fi; \
-	fi
 	@BUCKET=$$(cat build/artifacts-bucket.txt); \
 	aws cloudformation deploy \
 		--template-file cloudformation/centralized-hub.yaml \
@@ -341,10 +307,7 @@ deploy-hub: upload-artifacts
 			ArtifactsBucket=$$BUCKET \
 			OrganizationId=$(ORG_ID) \
 			ScannerExternalId=$(EXTERNAL_ID) \
-			EnableQualysTagging=$(TAG) \
-			EnableLambdaTagging=$(LAMBDA_TAG) \
-			QualysApiUsername=$(USERNAME) \
-			QualysApiPassword=$(PASSWORD) \
+			EnableTagging=$(TAG) \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--region $(AWS_REGION)
 	@echo ""
