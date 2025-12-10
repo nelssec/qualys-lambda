@@ -1,31 +1,3 @@
-"""
-Bulk Scan Lambda - Scans all existing Lambda functions across accounts and regions.
-
-This function is triggered manually or on a schedule to scan existing functions
-that weren't caught by the event-driven scanner (CreateFunction/UpdateFunction events).
-
-Architecture:
-- Directly invokes the scanner Lambda asynchronously for each function
-- Supports multi-region scanning within each account
-- Uses the existing DynamoDB cache to skip already-scanned functions
-
-Usage:
-- Invoke manually to scan all functions in an account
-- Schedule via EventBridge for periodic full scans (e.g., weekly)
-- Pass account_ids list to scan across multiple accounts (centralized mode)
-- Pass regions list to scan specific regions (defaults to current region)
-
-Environment Variables:
-- SCANNER_FUNCTION_NAME: Name of the scanner Lambda to invoke
-- CROSS_ACCOUNT_ROLE_NAME: Role name to assume in spoke accounts (optional)
-- SCANNER_EXTERNAL_ID: External ID for cross-account role assumption
-- EXCLUDE_PATTERNS: Comma-separated function name patterns to exclude
-- INVOCATION_DELAY_MS: Delay between batches in ms (default: 100)
-- MAX_WORKERS: Number of parallel invocation threads (default: 10)
-- BATCH_SIZE: Functions per batch before pause (default: 100)
-- DEFAULT_REGIONS: Comma-separated list of regions to scan (optional)
-"""
-
 import boto3
 import json
 import logging
@@ -59,17 +31,14 @@ REGION_PATTERN = re.compile(r'^[a-z]{2}-[a-z]+-\d+$')
 
 
 def validate_account_id(account_id: str) -> bool:
-    """Validate AWS account ID format."""
     return bool(ACCOUNT_ID_PATTERN.match(account_id))
 
 
 def validate_region(region: str) -> bool:
-    """Validate AWS region format."""
     return bool(REGION_PATTERN.match(region))
 
 
 def should_exclude(function_name: str, exclude_patterns: list) -> bool:
-    """Check if function should be excluded from scanning."""
     for pattern in exclude_patterns:
         pattern = pattern.strip()
         if pattern and pattern in function_name:
@@ -78,7 +47,6 @@ def should_exclude(function_name: str, exclude_patterns: list) -> bool:
 
 
 def get_lambda_client_for_region(region: str) -> Optional[boto3.client]:
-    """Get Lambda client for a specific region in current account."""
     if not validate_region(region):
         logger.error(f"Invalid region format: {region}")
         return None
@@ -91,7 +59,6 @@ def get_lambda_client_for_region(region: str) -> Optional[boto3.client]:
 
 
 def get_lambda_client_for_account(account_id: str, region: str = None) -> Optional[boto3.client]:
-    """Get Lambda client for a specific account and region (cross-account)."""
     if not CROSS_ACCOUNT_ROLE_NAME:
         return None
 
@@ -127,7 +94,6 @@ def get_lambda_client_for_account(account_id: str, region: str = None) -> Option
 
 
 def list_all_functions(client: boto3.client, exclude_patterns: list) -> List[Dict[str, Any]]:
-    """List all Lambda functions using pagination with generator for memory efficiency."""
     functions = []
     paginator = client.get_paginator('list_functions')
 
@@ -152,11 +118,6 @@ def list_all_functions(client: boto3.client, exclude_patterns: list) -> List[Dic
 
 
 def invoke_scanner(func: Dict[str, Any], source_account: str) -> Tuple[bool, str]:
-    """Invoke scanner Lambda asynchronously for a single function.
-
-    Returns:
-        Tuple of (success: bool, function_name: str)
-    """
     function_name = func.get('FunctionName', 'unknown')
 
     if not SCANNER_FUNCTION_NAME:
@@ -199,11 +160,6 @@ def invoke_scanner(func: Dict[str, Any], source_account: str) -> Tuple[bool, str
 
 
 def invoke_batch_parallel(functions: List[Dict[str, Any]], account_id: str) -> Tuple[int, int]:
-    """Invoke scanner for a batch of functions in parallel.
-
-    Returns:
-        Tuple of (invoked_count, failed_count)
-    """
     invoked = 0
     failed = 0
 
@@ -232,11 +188,6 @@ def invoke_batch_parallel(functions: List[Dict[str, Any]], account_id: str) -> T
 
 def process_region(account_id: str, region: str, current_account: str,
                     exclude_patterns: list, dry_run: bool) -> Dict[str, Any]:
-    """Process a single account/region combination.
-
-    Returns:
-        Dict with region results including functions, invoked, failed counts
-    """
     result = {
         'region': region,
         'status': 'pending',
@@ -308,22 +259,6 @@ def process_region(account_id: str, region: str, current_account: str,
 
 
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
-    """
-    Bulk scan handler.
-
-    Event format:
-    {
-        "account_ids": ["123456789012", "234567890123"],  # Optional: cross-account
-        "regions": ["us-east-1", "us-west-2"],  # Optional: regions to scan
-        "dry_run": false,  # Optional: just count, don't invoke scanner
-        "exclude_patterns": ["test-", "dev-"]  # Optional: additional excludes
-    }
-
-    Region behavior:
-    - If regions specified in event, use those
-    - Else if DEFAULT_REGIONS env var set, use those
-    - Else scan only current region
-    """
     logger.info(f"Bulk scan triggered with event: {json.dumps(event)}")
 
     # Validate scanner function is configured
