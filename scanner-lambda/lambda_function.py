@@ -313,16 +313,24 @@ def get_lambda_details(function_arn: str, target_lambda_client: Optional[Any] = 
     }
 
 
-def run_qscanner(function_arn: str, qualys_creds: Dict[str, str], aws_region: str) -> Dict[str, Any]:
-    cmd = [
+def run_qscanner(lambda_details: Dict[str, Any], qualys_creds: Dict[str, str], aws_region: str) -> Dict[str, Any]:
+    package_type = lambda_details.get('package_type', 'Zip')
+    function_arn = lambda_details['function_arn']
+    image_uri = lambda_details.get('image_uri')
+
+    base_cmd = [
         QSCANNER_PATH,
         '--pod', qualys_creds['qualys_pod'],
         '--access-token', qualys_creds['qualys_access_token'],
         '--output-dir', '/tmp/qscanner-output',
         '--cache-dir', '/tmp/qscanner-cache',
         '--scan-types', 'pkg,secret',
-        'lambda', function_arn
     ]
+
+    if package_type == 'Image' and image_uri:
+        cmd = base_cmd + ['image', image_uri]
+    else:
+        cmd = base_cmd + ['lambda', function_arn]
 
     env = os.environ.copy()
     env['AWS_REGION'] = aws_region
@@ -529,7 +537,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         aws_region = event.get('region', os.environ.get('AWS_REGION', 'us-east-1'))
 
         scan_start_time = time.time()
-        scan_results = run_qscanner(function_arn, qualys_creds, aws_region)
+        scan_results = run_qscanner(lambda_details, qualys_creds, aws_region)
         scan_duration = time.time() - scan_start_time
 
         update_scan_cache(function_arn, lambda_details, scan_results)
