@@ -56,9 +56,12 @@ Bulk scan options:
 | `dry_run` | `true` to list functions without scanning |
 | `exclude_patterns` | Function name prefixes to skip, e.g. `["test-", "dev-"]` |
 
-## Event-Driven Scanning
+## Automated Scanning
 
-After deployment, new and updated Lambda functions are scanned automatically via CloudTrail + EventBridge. No action required.
+Two scanning modes are active after deployment:
+
+- **Event-driven** - New and updated Lambda functions are scanned automatically via CloudTrail + EventBridge
+- **Daily full scan** - A scheduled bulk scan runs every day at 2:00 AM UTC, catching any functions that were missed
 
 ## View Results
 

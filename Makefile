@@ -263,6 +263,7 @@ quickstart: layer package create-bucket
 			QScannerLayerKey=qscanner-layer.zip \
 			EnableBulkScan=true \
 			EnableTagging=$(TAG) \
+			BulkScanSchedule='cron(0 2 * * ? *)' \
 		--capabilities CAPABILITY_NAMED_IAM \
 		--region $(AWS_REGION)
 	@echo "Deployment complete!"
