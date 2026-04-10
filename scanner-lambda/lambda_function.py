@@ -496,7 +496,9 @@ def store_results(
 
     if RESULTS_S3_BUCKET:
         try:
-            key = f"scans/{lambda_details['function_name']}/{timestamp}.json"
+            account_id = lambda_details.get('account_id', 'unknown')
+            region = lambda_details.get('region', 'unknown')
+            key = f"scans/{account_id}/{region}/{lambda_details['function_name']}/{timestamp}.json"
             _s3_put_object(RESULTS_S3_BUCKET, key, json.dumps(full_results, indent=2))
         except Exception as e:
             logger.error(f"S3 storage error: {e}")
@@ -589,10 +591,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         target_lambda_client, assumed_credentials = get_target_lambda_client(cross_account_role_arn, region_name=target_region)
         lambda_details = get_lambda_details(function_arn, target_lambda_client)
+        lambda_details['account_id'] = target_account_id
+        lambda_details['region'] = target_region or event.get('region', os.environ.get('AWS_REGION', 'us-east-1'))
 
         code_sha256 = lambda_details.get('code_sha256')
         if code_sha256 and check_scan_cache(function_arn, code_sha256):
             publish_custom_metrics({'cache_hit': True})
+            if ENABLE_TAGGING:
+                tag_lambda_function(
+                    function_arn,
+                    datetime.utcnow().isoformat(),
+                    True,
+                    False,
+                    target_lambda_client
+                )
             return {
                 'statusCode': 200,
                 'body': json.dumps({
